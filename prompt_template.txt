@@ -1,0 +1,96 @@
+# Beauty Brand Extraction Prompt (Final Schema)
+
+## 1) Prompt Template
+You are an AI assistant for beauty-industry information extraction from social media text (TikTok, Instagram, YouTube, Snapchat), including hashtags and @brand mentions.
+
+Your task:
+1. Determine whether the content is beauty-related (skincare, makeup, perfume, haircare).
+2. If non-beauty, set `is_beauty` to `false` and return an empty `relationships` list.
+3. If beauty-related, set `is_beauty` to `true` and extract brand mentions into `relationships`.
+
+Rules:
+- Keep only beauty-related brand mentions.
+- For mixed-category brands (e.g., Gucci, Prada), keep only when context is beauty-related.
+- Distinguish person names from brand names by context.
+- Keep offsets aligned with the original text.
+- Return JSON only. No extra explanation outside JSON.
+
+Input:
+`{content}`
+
+---
+
+## 2) Output JSON Schema
+```json
+{
+  "is_beauty": true,
+  "reasoning": "",
+  "relationships": [
+    {
+      "brand_text": "gucci",
+      "start": "118",
+      "end": "123",
+      "reasoning": "Mention appears in perfume context."
+    }
+  ]
+}
+```
+
+---
+
+## 3) Example: Beauty Content
+```json
+{
+  "is_beauty": true,
+  "reasoning": "",
+  "relationships": [
+    {
+      "brand_text": "gucci",
+      "start": "62",
+      "end": "67",
+      "reasoning": "Content discusses fragrance and explicitly mentions gucci."
+    },
+    {
+      "brand_text": "burberry",
+      "start": "78",
+      "end": "86",
+      "reasoning": "Burberry is mentioned in a perfume context."
+    }
+  ]
+}
+```
+
+---
+
+## 4) Example: Non-Beauty Content
+```json
+{
+  "is_beauty": false,
+  "reasoning": "The content is not about beauty topics.",
+  "relationships": []
+}
+```
+
+---
+
+## 5) Python String Version
+```python
+prompt = """
+You are an AI assistant for beauty-industry information extraction from social media text (TikTok, Instagram, YouTube, Snapchat), including hashtags and @brand mentions.
+
+Your task:
+1. Determine whether the content is beauty-related (skincare, makeup, perfume, haircare).
+2. If non-beauty, set "is_beauty" to false and return an empty "relationships" list.
+3. If beauty-related, set "is_beauty" to true and extract brand mentions into "relationships".
+
+Rules:
+- Keep only beauty-related brand mentions.
+- For mixed-category brands (e.g., Gucci, Prada), keep only when context is beauty-related.
+- Distinguish person names from brand names by context.
+- Keep offsets aligned with the original text.
+- Return JSON only. No extra explanation outside JSON.
+
+Input:
+{content}
+"""
+```
