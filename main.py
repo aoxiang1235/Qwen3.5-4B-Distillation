@@ -443,8 +443,8 @@ def parse_args():
     parser.add_argument(
         "--max_grad_norm",
         type=float,
-        default=1.0,
-        help="梯度裁剪阈值；建议 1.0（更稳），设为 0 可关闭裁剪",
+        default=0.0,
+        help="梯度裁剪阈值；P100 环境建议 0 关闭裁剪，避免 FP16 unscale 异常",
     )
     return parser.parse_args()
 
@@ -545,7 +545,7 @@ def main():
         logging_steps=log_steps,
         warmup_ratio=0.03,
         bf16=False,
-        fp16=True,
+        fp16=False,
         max_grad_norm=args.max_grad_norm,
         save_total_limit=3,
         load_best_model_at_end=True,
