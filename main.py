@@ -270,7 +270,6 @@ def tokenize_fn(tokenizer, max_length: int):
                 truncation=True,
                 max_length=max_length,
                 padding=False,
-                truncation_side="left",
             )
             ids = enc["input_ids"]
             attn = enc["attention_mask"]
@@ -444,6 +443,7 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(args.model_name, use_fast=False)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.truncation_side = "left"
     model = create_model(args.model_name, use_4bit=args.use_4bit)
     model.print_trainable_parameters()
 
