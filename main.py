@@ -338,6 +338,34 @@ def create_model(model_name: str, use_4bit: bool):
     return model
 
 
+def _aligned_logging_steps(requested: int, grad_accum: int) -> int:
+    """与 gradient_accumulation 对齐，减少 Trainer 在累积边界上打出 loss=0 的误导日志。"""
+    if requested > 0:
+        base = max(1, requested)
+    else:
+        base = 20
+    ga = max(1, grad_accum)
+    aligned = ((base + ga - 1) // ga) * ga
+    return max(ga, aligned)
+
+
+def _filter_weak_supervision(ds, min_tokens: int, split_name: str):
+    """去掉 labels 全为 -100 或有效 token 过少的样本。"""
+
+    def _ok(example: Dict[str, List[int]]) -> bool:
+        return sum(1 for t in example["labels"] if t != -100) >= min_tokens
+
+    n_before = len(ds)
+    out = ds.filter(_ok)
+    n_after = len(out)
+    print(f"  - {split_name}: 过滤弱监督样本 {n_before} -> {n_after} (min_supervised_tokens={min_tokens})")
+    if n_after < 10:
+        raise RuntimeError(
+            f"{split_name} 过滤后样本不足 10 条，请降低 --min_supervised_tokens 或检查截断/模板。"
+        )
+    return out
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Qwen3.5-4B 蒸馏训练")
     parser.add_argument(
@@ -383,6 +411,24 @@ def parse_args():
         type=int,
         default=-1,
         help="仅训练若干 step 即停（云端冒烟用）；-1 表示按 num_train_epochs 跑满",
+    )
+    parser.add_argument(
+        "--min_supervised_tokens",
+        type=int,
+        default=2,
+        help="每条样本至少要有多少个非 -100 的 label token，否则丢弃（避免 loss=0 / 反传异常）",
+    )
+    parser.add_argument(
+        "--logging_steps",
+        type=int,
+        default=0,
+        help="日志步长；0 表示自动取不小于 20 且为 grad_accum 倍数的值，与梯度累积对齐",
+    )
+    parser.add_argument(
+        "--max_grad_norm",
+        type=float,
+        default=0.0,
+        help="梯度裁剪阈值；0 表示关闭裁剪（部分环境下 clip 与 fp16 组合会产生 grad_norm=nan 日志）",
     )
     return parser.parse_args()
 
@@ -453,6 +499,18 @@ def main():
         batched=True,
         remove_columns=dataset["train"].column_names,
     )
+    tokenized["train"] = _filter_weak_supervision(
+        tokenized["train"], args.min_supervised_tokens, "train"
+    )
+    tokenized["validation"] = _filter_weak_supervision(
+        tokenized["validation"], args.min_supervised_tokens, "validation"
+    )
+
+    log_steps = _aligned_logging_steps(args.logging_steps, args.grad_accum)
+    if args.logging_steps > 0 and log_steps != args.logging_steps:
+        print(
+            f"  - logging_steps 已从 {args.logging_steps} 调整为 {log_steps}（与 grad_accum={args.grad_accum} 对齐）"
+        )
 
     print("[5/5] 开始训练")
     training_args = TrainingArguments(
@@ -466,10 +524,11 @@ def main():
         evaluation_strategy="steps",
         eval_steps=100,
         save_steps=100,
-        logging_steps=20,
+        logging_steps=log_steps,
         warmup_ratio=0.03,
         bf16=False,
         fp16=False,
+        max_grad_norm=args.max_grad_norm,
         save_total_limit=3,
         load_best_model_at_end=True,
         metric_for_best_model="eval_loss",
