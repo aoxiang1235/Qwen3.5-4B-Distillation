@@ -207,7 +207,6 @@ def tokenize_fn(tokenizer, max_length: int):
             max_length=max_length,
             padding=False,
         )
-        tokenized["labels"] = tokenized["input_ids"].copy()
         return tokenized
 
     return _tokenize
@@ -219,13 +218,13 @@ def create_model(model_name: str, use_4bit: bool):
         quant_config = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch.bfloat16,
+            bnb_4bit_compute_dtype=torch.float16,
             bnb_4bit_use_double_quant=True,
         )
 
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
-        torch_dtype=torch.bfloat16,
+        torch_dtype=torch.float16,
         quantization_config=quant_config,
         device_map="auto",
     )
@@ -374,7 +373,7 @@ def main():
         save_steps=100,
         logging_steps=20,
         warmup_ratio=0.03,
-        bf16=torch.cuda.is_available(),
+        bf16=False,
         fp16=False,
         save_total_limit=3,
         load_best_model_at_end=True,
