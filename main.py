@@ -243,7 +243,7 @@ def tokenize_fn(tokenizer, max_length: int):
     return _tokenize
 
 
-def create_model(model_name: str, use_4bit: bool):
+def create_model(model_name: str, use_4bit: bool, model_dtype: str):
     quant_config: Optional[BitsAndBytesConfig] = None
     if use_4bit:
         quant_config = BitsAndBytesConfig(
@@ -253,9 +253,16 @@ def create_model(model_name: str, use_4bit: bool):
             bnb_4bit_use_double_quant=True,
         )
 
+    dtype_map = {
+        "float16": torch.float16,
+        "float32": torch.float32,
+    }
+    if model_dtype not in dtype_map:
+        raise ValueError(f"不支持的 --model_dtype: {model_dtype}")
+
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
-        torch_dtype=torch.float16,
+        torch_dtype=dtype_map[model_dtype],
         quantization_config=quant_config,
         device_map="auto",
     )
@@ -347,6 +354,13 @@ def parse_args():
         help="Student 模型名（建议换成你的 Qwen3.5-4B 路径）",
     )
     parser.add_argument(
+        "--model_dtype",
+        type=str,
+        choices=["float16", "float32"],
+        default="float32",
+        help="模型权重加载精度；P100 上为避免 loss 数值爆炸，默认用 float32",
+    )
+    parser.add_argument(
         "--output_dir",
         type=str,
         default="./distilled-qwen",
@@ -381,8 +395,8 @@ def parse_args():
     parser.add_argument(
         "--max_grad_norm",
         type=float,
-        default=0.0,
-        help="梯度裁剪阈值；P100 环境建议 0 关闭裁剪，避免 FP16 unscale 异常",
+        default=1.0,
+        help="梯度裁剪阈值；默认 1.0 以提升数值稳定性",
     )
     return parser.parse_args()
 
@@ -434,7 +448,12 @@ def main():
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.truncation_side = "left"
-    model = create_model(args.model_name, use_4bit=args.use_4bit)
+    print(f"  - model_dtype: {args.model_dtype}")
+    model = create_model(
+        args.model_name,
+        use_4bit=args.use_4bit,
+        model_dtype=args.model_dtype,
+    )
     model.print_trainable_parameters()
 
     print("[4/5] Tokenize")
