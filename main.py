@@ -13,7 +13,7 @@ import os
 import random
 import zipfile
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 import xml.etree.ElementTree as ET
 
 import torch
@@ -23,7 +23,6 @@ from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
     BitsAndBytesConfig,
-    DataCollatorForLanguageModeling,
     Trainer,
     TrainingArguments,
 )
@@ -172,6 +171,44 @@ def format_chat(example: DistillExample, tokenizer) -> str:
     )
 
 
+@dataclass
+class DataCollatorForCausalLMCustom:
+    """batch 内 padding；仅将 padding（attention_mask==0）标为 -100，避免 pad==eos 时误 mask。"""
+
+    tokenizer: Any
+
+    def __call__(self, features: List[Dict[str, List[int]]]) -> Dict[str, torch.Tensor]:
+        input_ids = [torch.tensor(f["input_ids"], dtype=torch.long) for f in features]
+        attention_mask = [torch.tensor(f["attention_mask"], dtype=torch.long) for f in features]
+        labels = [torch.tensor(f["labels"], dtype=torch.long) for f in features]
+        pad_id = self.tokenizer.pad_token_id
+        if pad_id is None:
+            pad_id = 0
+        input_ids_t = torch.nn.utils.rnn.pad_sequence(
+            input_ids, batch_first=True, padding_value=pad_id
+        )
+        attention_mask_t = torch.nn.utils.rnn.pad_sequence(
+            attention_mask, batch_first=True, padding_value=0
+        )
+        labels_t = torch.nn.utils.rnn.pad_sequence(
+            labels, batch_first=True, padding_value=-100
+        )
+        labels_t = labels_t.masked_fill(attention_mask_t == 0, -100)
+        return {
+            "input_ids": input_ids_t,
+            "attention_mask": attention_mask_t,
+            "labels": labels_t,
+        }
+
+
+def _lcp_token_len(a: List[int], b: List[int]) -> int:
+    n = min(len(a), len(b))
+    i = 0
+    while i < n and a[i] == b[i]:
+        i += 1
+    return i
+
+
 def split_dataset(
     examples: List[DistillExample],
     val_ratio: float = 0.02,
@@ -189,25 +226,76 @@ def split_dataset(
 
 
 def tokenize_fn(tokenizer, max_length: int):
+    system_content = "你是一个严谨的结构化信息抽取助手。"
+
     def _tokenize(batch):
-        texts = []
+        input_ids_list: List[List[int]] = []
+        attention_mask_list: List[List[int]] = []
+        labels_list: List[List[int]] = []
+
         for ins, inp, out in zip(
             batch["instruction"],
             batch["input_text"],
             batch["output_text"],
         ):
-            chat_text = format_chat(
-                DistillExample(ins, inp, out),
-                tokenizer=tokenizer,
+            ex = DistillExample(ins, inp, out)
+            messages_full = [
+                {"role": "system", "content": system_content},
+                {
+                    "role": "user",
+                    "content": f"指令：{ex.instruction}\n\n文本：{ex.input_text}",
+                },
+                {"role": "assistant", "content": ex.output_text},
+            ]
+            messages_prompt = [
+                {"role": "system", "content": system_content},
+                {
+                    "role": "user",
+                    "content": f"指令：{ex.instruction}\n\n文本：{ex.input_text}",
+                },
+            ]
+            full_text = tokenizer.apply_chat_template(
+                messages_full,
+                tokenize=False,
+                add_generation_prompt=False,
             )
-            texts.append(chat_text)
-        tokenized = tokenizer(
-            texts,
-            truncation=True,
-            max_length=max_length,
-            padding=False,
-        )
-        return tokenized
+            prompt_ids = tokenizer.apply_chat_template(
+                messages_prompt,
+                tokenize=True,
+                add_generation_prompt=True,
+            )
+            full_no_trunc = tokenizer(full_text, truncation=False)["input_ids"]
+            enc = tokenizer(
+                full_text,
+                truncation=True,
+                max_length=max_length,
+                padding=False,
+                truncation_side="left",
+            )
+            ids = enc["input_ids"]
+            attn = enc["attention_mask"]
+            if len(full_no_trunc) >= len(prompt_ids) and full_no_trunc[
+                : len(prompt_ids)
+            ] == prompt_ids:
+                assistant_start_full = len(prompt_ids)
+            else:
+                assistant_start_full = _lcp_token_len(prompt_ids, full_no_trunc)
+            cut = max(0, len(full_no_trunc) - len(ids))
+            assistant_start_in_seq = max(0, assistant_start_full - cut)
+
+            labels = list(ids)
+            for i in range(min(assistant_start_in_seq, len(labels))):
+                labels[i] = -100
+
+            input_ids_list.append(ids)
+            attention_mask_list.append(attn)
+            labels_list.append(labels)
+
+        return {
+            "input_ids": input_ids_list,
+            "attention_mask": attention_mask_list,
+            "labels": labels_list,
+        }
 
     return _tokenize
 
@@ -291,6 +379,12 @@ def parse_args():
     parser.add_argument("--val_ratio", type=float, default=0.02)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--use_4bit", action="store_true")
+    parser.add_argument(
+        "--max_steps",
+        type=int,
+        default=-1,
+        help="仅训练若干 step 即停（云端冒烟用）；-1 表示按 num_train_epochs 跑满",
+    )
     return parser.parse_args()
 
 
@@ -364,6 +458,7 @@ def main():
     training_args = TrainingArguments(
         output_dir=args.output_dir,
         num_train_epochs=args.epochs,
+        max_steps=args.max_steps if args.max_steps > 0 else -1,
         learning_rate=args.lr,
         per_device_train_batch_size=args.batch_size,
         per_device_eval_batch_size=args.batch_size,
@@ -388,7 +483,7 @@ def main():
         train_dataset=tokenized["train"],
         eval_dataset=tokenized["validation"],
         tokenizer=tokenizer,
-        data_collator=DataCollatorForLanguageModeling(tokenizer, mlm=False),
+        data_collator=DataCollatorForCausalLMCustom(tokenizer=tokenizer),
     )
     trainer.train()
 
