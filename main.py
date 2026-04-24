@@ -416,7 +416,7 @@ def parse_args():
     )
     parser.add_argument("--max_length", type=int, default=1024)
     parser.add_argument("--epochs", type=float, default=1.0)
-    parser.add_argument("--lr", type=float, default=2e-5)
+    parser.add_argument("--lr", type=float, default=1e-6)
     parser.add_argument("--batch_size", type=int, default=2)
     parser.add_argument("--grad_accum", type=int, default=8)
     parser.add_argument("--val_ratio", type=float, default=0.02)
@@ -443,8 +443,8 @@ def parse_args():
     parser.add_argument(
         "--max_grad_norm",
         type=float,
-        default=0.0,
-        help="梯度裁剪阈值；0 表示关闭裁剪（部分环境下 clip 与 fp16 组合会产生 grad_norm=nan 日志）",
+        default=1.0,
+        help="梯度裁剪阈值；建议 1.0（更稳），设为 0 可关闭裁剪",
     )
     return parser.parse_args()
 
@@ -545,7 +545,7 @@ def main():
         logging_steps=log_steps,
         warmup_ratio=0.03,
         bf16=False,
-        fp16=False,
+        fp16=True,
         max_grad_norm=args.max_grad_norm,
         save_total_limit=3,
         load_best_model_at_end=True,
