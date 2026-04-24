@@ -366,6 +366,22 @@ def _filter_weak_supervision(ds, min_tokens: int, split_name: str):
     return out
 
 
+def _print_supervision_stats(ds, split_name: str):
+    counts = [sum(1 for t in row["labels"] if t != -100) for row in ds]
+    if not counts:
+        raise RuntimeError(f"{split_name} 没有可用样本。")
+    counts_sorted = sorted(counts)
+    n = len(counts_sorted)
+    p50 = counts_sorted[n // 2]
+    p90 = counts_sorted[min(n - 1, int(n * 0.9))]
+    min_v = counts_sorted[0]
+    max_v = counts_sorted[-1]
+    mean_v = sum(counts_sorted) / n
+    print(
+        f"  - {split_name} 监督 token 统计: min={min_v}, p50={p50}, p90={p90}, max={max_v}, mean={mean_v:.1f}"
+    )
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Qwen3.5-4B 蒸馏训练")
     parser.add_argument(
@@ -400,7 +416,7 @@ def parse_args():
     )
     parser.add_argument("--max_length", type=int, default=1024)
     parser.add_argument("--epochs", type=float, default=1.0)
-    parser.add_argument("--lr", type=float, default=2e-4)
+    parser.add_argument("--lr", type=float, default=2e-5)
     parser.add_argument("--batch_size", type=int, default=2)
     parser.add_argument("--grad_accum", type=int, default=8)
     parser.add_argument("--val_ratio", type=float, default=0.02)
@@ -505,6 +521,8 @@ def main():
     tokenized["validation"] = _filter_weak_supervision(
         tokenized["validation"], args.min_supervised_tokens, "validation"
     )
+    _print_supervision_stats(tokenized["train"], "train")
+    _print_supervision_stats(tokenized["validation"], "validation")
 
     log_steps = _aligned_logging_steps(args.logging_steps, args.grad_accum)
     if args.logging_steps > 0 and log_steps != args.logging_steps:
