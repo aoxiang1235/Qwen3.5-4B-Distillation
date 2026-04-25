@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """
-Qwen3.5-4B 响应蒸馏训练脚本。
+Qwen3.5-4B 监督微调（SFT）训练脚本，本质是「用 JSONL 里的目标输出」做因果语言模型训练。
 
-仅支持 JSONL 数据入口：
-1) 每行一个样本，字段为 instruction/content/output
+训练方法简述：
+- 基座：Qwen3.5-4B，默认从魔搭 ModelScope 拉取/复用本地缓存，也可用 --model_source huggingface 或本机目录。
+- 只训练 LoRA 适配器（r=16, alpha=32），全参冻结，省显存、不易灾难性遗忘。
+- 将 instruction/content 拼成 prompt，只在「助手回复」段计算 loss（其余 token 的 labels 为 -100）；可选梯度检查点降显存。
+- HuggingFace Trainer 做反向与日志；nohup 到文件时建议: PYTHONUNBUFFERED=1 python3 -u new_mian.py ...
 
-默认从魔搭 ModelScope 拉取基座（--model_source modelscope，需 pip install modelscope）；
-若本机目录已有完整模型，可传该目录为 --model_name 以跳过下载。
+仅支持 JSONL 数据入口：每行 instruction / content / output 字段。
+若本机已有完整基座，把目录传给 --model_name 可跳过下载。
 """
 
 import argparse
@@ -14,6 +17,7 @@ import inspect
 import json
 import os
 import random
+import sys
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -247,7 +251,12 @@ def tokenize_fn(tokenizer, max_length: int):
     return _tokenize
 
 
-def create_model(model_name: str, use_4bit: bool, model_dtype: str):
+def create_model(
+    model_name: str,
+    use_4bit: bool,
+    model_dtype: str,
+    gradient_checkpointing: bool = True,
+):
     quant_config: Optional[BitsAndBytesConfig] = None
     if use_4bit:
         quant_config = BitsAndBytesConfig(
@@ -290,6 +299,13 @@ def create_model(model_name: str, use_4bit: bool, model_dtype: str):
         task_type="CAUSAL_LM",
     )
     model = get_peft_model(model, peft_config)
+    if gradient_checkpointing:
+        model.config.use_cache = False
+        if hasattr(model, "enable_input_require_grads"):
+            model.enable_input_require_grads()
+        if hasattr(model, "gradient_checkpointing_enable"):
+            model.gradient_checkpointing_enable()
+        print("  - gradient_checkpointing: 已开启（降低显存）")
     return model
 
 
@@ -415,6 +431,11 @@ def parse_args():
         default=1.0,
         help="梯度裁剪阈值；默认 1.0 以提升数值稳定性",
     )
+    parser.add_argument(
+        "--no_gradient_checkpointing",
+        action="store_true",
+        help="关闭梯度检查点（默认开启以降低显存；关闭可略快但易 OOM）",
+    )
     return parser.parse_args()
 
 
@@ -498,6 +519,7 @@ def main():
         pretrained,
         use_4bit=args.use_4bit,
         model_dtype=args.model_dtype,
+        gradient_checkpointing=not args.no_gradient_checkpointing,
     )
     model.print_trainable_parameters()
 
@@ -523,6 +545,12 @@ def main():
         )
 
     print("[5/5] 开始训练")
+    # 便于 nohup 日志：行缓冲 + 关闭 tqdm，避免 loss 行被 \r 进度条盖掉
+    if hasattr(sys.stdout, "reconfigure"):
+        try:
+            sys.stdout.reconfigure(line_buffering=True)  # type: ignore[union-attr]
+        except (OSError, ValueError, AttributeError):
+            pass
     # Transformers 5.x: evaluation_strategy was renamed to eval_strategy.
     _ta = inspect.signature(TrainingArguments.__init__).parameters
     _eval_kw = (
@@ -530,6 +558,11 @@ def main():
         if "eval_strategy" in _ta
         else {"evaluation_strategy": "steps"}
     )
+    _log_extra: Dict[str, Any] = {"disable_tqdm": True}
+    if "logging_first_step" in _ta:
+        _log_extra["logging_first_step"] = True
+    if "log_level" in _ta:
+        _log_extra["log_level"] = "info"
     training_args = TrainingArguments(
         output_dir=args.output_dir,
         num_train_epochs=args.epochs,
@@ -551,6 +584,7 @@ def main():
         metric_for_best_model="eval_loss",
         greater_is_better=False,
         report_to="none",
+        **_log_extra,
     )
 
     # Transformers 5.x: Trainer 使用 processing_class 替代 tokenizer 参数名。
