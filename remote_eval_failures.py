@@ -1,3 +1,19 @@
+"""
+用途:
+- 对 `remote_eval_20.py` 的失败样本做定向诊断，输出“失败类型 + 失败原因 + 输出片段”。
+
+评估逻辑:
+1) 从 `data/train.jsonl` 抽样 N 条（默认 20，seed 固定为 42）。
+2) 逐条推理后先做 JSON 解析:
+   - 解析失败 => `json_parse_fail`
+3) 若可解析，再做 schema 检查:
+   - 不符合 => `schema_fail` + 具体原因（如缺字段/类型不匹配）
+4) 最终只输出失败样本摘要，便于快速定位问题模式。
+
+运行方式:
+- 云端: `python remote_eval_failures.py`
+"""
+
 import json
 import random
 
@@ -13,6 +29,7 @@ SEED = 42
 
 
 def load_data(path):
+    """读取 JSONL 数据，每行一个样本。"""
     rows = []
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
@@ -23,6 +40,7 @@ def load_data(path):
 
 
 def valid_output_schema(obj):
+    """返回 (是否通过, 失败原因) 以便定位 schema 失败类型。"""
     if not isinstance(obj, dict):
         return False, "top_level_not_object"
     for k in ("is_beauty", "reasoning", "relationships"):
@@ -46,6 +64,7 @@ def valid_output_schema(obj):
 
 
 def main():
+    # 固定抽样，便于不同版本模型做同集对比。
     random.seed(SEED)
     rows = load_data(DATA)
     samples = random.sample(rows, min(N, len(rows)))
@@ -78,6 +97,7 @@ def main():
         try:
             parsed = json.loads(txt)
         except Exception as exc:
+            # 第一类失败: 输出不是合法 JSON。
             fails.append(
                 {
                     "idx": i,
@@ -91,6 +111,7 @@ def main():
 
         ok, reason = valid_output_schema(parsed)
         if not ok:
+            # 第二类失败: JSON 可解析，但不符合目标 schema。
             fails.append(
                 {
                     "idx": i,

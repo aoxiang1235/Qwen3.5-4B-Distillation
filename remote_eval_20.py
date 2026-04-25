@@ -1,3 +1,18 @@
+"""
+用途:
+- 对训练好的 LoRA 模型做一个快速结构化输出健康检查（不是最终精度评估）。
+
+评估逻辑:
+1) 从 `data/train.jsonl` 随机抽样 N 条（默认 20）。
+2) 逐条推理，统计:
+   - json_parse_ok: 输出能被 json.loads 解析的比例
+   - schema_ok: 输出是否满足目标 schema 的比例
+3) 打印前 3 条样例，便于人工检查输出风格与错误模式。
+
+运行方式:
+- 云端: `python remote_eval_20.py`
+"""
+
 import json
 import random
 
@@ -13,6 +28,7 @@ SEED = 42
 
 
 def load_data(path):
+    """读取 JSONL 样本，每行一个 JSON 对象。"""
     rows = []
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
@@ -24,6 +40,7 @@ def load_data(path):
 
 
 def valid_output_schema(obj):
+    """检查模型输出是否满足目标 schema（字段和类型）。"""
     if not isinstance(obj, dict):
         return False
     for k in ("is_beauty", "reasoning", "relationships"):
@@ -45,11 +62,13 @@ def valid_output_schema(obj):
 
 
 def main():
+    # 固定随机种子，保证抽样可复现，方便横向比较不同模型版本。
     random.seed(SEED)
     rows = load_data(DATA)
     samples = random.sample(rows, min(N, len(rows)))
 
     print("loading model...")
+    # 加载基座模型 + LoRA 适配器。
     tokenizer = AutoTokenizer.from_pretrained(BASE, use_fast=False)
     model = AutoModelForCausalLM.from_pretrained(
         BASE,
@@ -80,14 +99,17 @@ def main():
 
         parsed = None
         try:
+            # 一级检查: 输出是否可解析为 JSON。
             parsed = json.loads(txt)
             ok_json += 1
+            # 二级检查: JSON 字段是否符合预期 schema。
             if valid_output_schema(parsed):
                 ok_schema += 1
         except Exception:
             pass
 
         if i <= 3:
+            # 仅保留少量样例，方便快速人工排查。
             outputs.append(
                 {
                     "idx": i,
