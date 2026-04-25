@@ -553,12 +553,19 @@ def main():
         report_to="none",
     )
 
+    # Transformers 5.x: Trainer 使用 processing_class 替代 tokenizer 参数名。
+    _trp = inspect.signature(Trainer.__init__).parameters
+    _tok_kw = (
+        {"processing_class": tokenizer}
+        if "processing_class" in _trp
+        else {"tokenizer": tokenizer}
+    )
     trainer = Trainer(
         model=model,
         args=training_args,
         train_dataset=tokenized["train"],
         eval_dataset=tokenized["validation"],
-        tokenizer=tokenizer,
+        **_tok_kw,
         data_collator=DataCollatorForCausalLMCustom(tokenizer=tokenizer),
     )
     trainer.train()
