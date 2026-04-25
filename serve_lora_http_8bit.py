@@ -6,13 +6,13 @@ from typing import Any, Dict
 
 import torch
 from peft import PeftModel
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
 
 def build_parser() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="LoRA HTTP inference server")
+    parser = argparse.ArgumentParser(description="LoRA HTTP inference server (8bit)")
     parser.add_argument("--host", type=str, default="0.0.0.0")
-    parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--port", type=int, default=8001)
     parser.add_argument("--base_model", type=str, default="Qwen/Qwen2.5-3B-Instruct")
     parser.add_argument(
         "--adapter_path", type=str, default="distilled-qwen-f32_full_20260424"
@@ -24,11 +24,11 @@ def build_parser() -> argparse.Namespace:
 def create_app_state(args: argparse.Namespace) -> Dict[str, Any]:
     print(f"[load] base_model={args.base_model}")
     print(f"[load] adapter={args.adapter_path}")
-    print("[load] quantization=fp16")
+    print("[load] quantization=8bit")
     tokenizer = AutoTokenizer.from_pretrained(args.base_model, use_fast=False)
     model = AutoModelForCausalLM.from_pretrained(
         args.base_model,
-        torch_dtype=torch.float16,
+        quantization_config=BitsAndBytesConfig(load_in_8bit=True),
         device_map="auto",
     )
     model = PeftModel.from_pretrained(model, args.adapter_path)
