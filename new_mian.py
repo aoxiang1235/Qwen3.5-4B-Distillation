@@ -10,6 +10,7 @@ Qwen3.5-4B 响应蒸馏训练脚本。
 """
 
 import argparse
+import inspect
 import json
 import os
 import random
