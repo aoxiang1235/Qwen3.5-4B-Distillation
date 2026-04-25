@@ -1,0 +1,6 @@
+# ModelScope / local HF caches (large, do not commit)
+.modelscope/
+.hf_cache_test/
+
+__pycache__/
+*.py[cod]

@@ -4,6 +4,9 @@ Qwen3.5-4B 响应蒸馏训练脚本。
 
 仅支持 JSONL 数据入口：
 1) 每行一个样本，字段为 instruction/content/output
+
+默认从魔搭 ModelScope 拉取基座（--model_source modelscope，需 pip install modelscope）；
+若本机目录已有完整模型，可传该目录为 --model_name 以跳过下载。
 """
 
 import argparse
@@ -351,7 +354,20 @@ def parse_args():
         "--model_name",
         type=str,
         default="Qwen/Qwen3.5-4B",
-        help="Student 模型名（建议换成你的 Qwen3.5-4B 路径）",
+        help="魔搭 / HF 的模型 id，或本机已下载目录（见 --model_source）",
+    )
+    parser.add_argument(
+        "--model_source",
+        type=str,
+        choices=["modelscope", "huggingface"],
+        default="modelscope",
+        help="modelscope=从魔搭 ModelScope 下载/复用缓存；huggingface=从 Hugging Face Hub 拉取",
+    )
+    parser.add_argument(
+        "--modelscope_cache",
+        type=str,
+        default="",
+        help="ModelScope 缓存根目录；留空则使用 <cwd>/.modelscope 或环境变量 MODELSCOPE_CACHE",
     )
     parser.add_argument(
         "--model_dtype",
@@ -401,6 +417,33 @@ def parse_args():
     return parser.parse_args()
 
 
+def resolve_pretrained_path(args) -> str:
+    """
+    将 --model_name 解析为可传给 from_pretrained 的路径或 id。
+    - 若本机目录下已有 config.json，则直接使用（不走魔搭 / HF 下载逻辑）。
+    - 否则按 --model_source 从魔搭或 HF 取权重。
+    """
+    name = (args.model_name or "").strip()
+    if not name:
+        raise ValueError("请设置 --model_name。")
+    if os.path.isfile(os.path.join(name, "config.json")):
+        return os.path.abspath(name)
+    if args.model_source == "huggingface":
+        return name
+    try:
+        from modelscope import snapshot_download
+    except ImportError as e:
+        raise ImportError(
+            "已选择 --model_source modelscope，但未安装 modelscope。请执行: pip install modelscope"
+        ) from e
+    cache = (args.modelscope_cache or "").strip() or os.environ.get(
+        "MODELSCOPE_CACHE", os.path.join(os.getcwd(), ".modelscope")
+    )
+    os.makedirs(cache, exist_ok=True)
+    print(f"  - ModelScope: {name}（缓存根目录: {cache}）")
+    return snapshot_download(name, cache_dir=cache)
+
+
 def main():
     args = parse_args()
     random.seed(args.seed)
@@ -443,14 +486,15 @@ def main():
         f"  - train: {len(dataset['train'])}, validation: {len(dataset['validation'])}"
     )
 
-    print(f"[3/5] 加载 tokenizer/model: {args.model_name}")
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name, use_fast=False)
+    pretrained = resolve_pretrained_path(args)
+    print(f"[3/5] 加载 tokenizer/model: {args.model_name} -> {pretrained}")
+    tokenizer = AutoTokenizer.from_pretrained(pretrained, use_fast=False)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.truncation_side = "left"
     print(f"  - model_dtype: {args.model_dtype}")
     model = create_model(
-        args.model_name,
+        pretrained,
         use_4bit=args.use_4bit,
         model_dtype=args.model_dtype,
     )
@@ -478,6 +522,13 @@ def main():
         )
 
     print("[5/5] 开始训练")
+    # Transformers 5.x: evaluation_strategy was renamed to eval_strategy.
+    _ta = inspect.signature(TrainingArguments.__init__).parameters
+    _eval_kw = (
+        {"eval_strategy": "steps"}
+        if "eval_strategy" in _ta
+        else {"evaluation_strategy": "steps"}
+    )
     training_args = TrainingArguments(
         output_dir=args.output_dir,
         num_train_epochs=args.epochs,
@@ -486,7 +537,7 @@ def main():
         per_device_train_batch_size=args.batch_size,
         per_device_eval_batch_size=args.batch_size,
         gradient_accumulation_steps=args.grad_accum,
-        evaluation_strategy="steps",
+        **_eval_kw,
         eval_steps=100,
         save_steps=100,
         logging_steps=log_steps,
