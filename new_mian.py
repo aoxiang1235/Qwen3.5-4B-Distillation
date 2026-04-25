@@ -19,7 +19,7 @@ def main() -> int:
 
     # Apply Qwen3.5-4B defaults unless user explicitly overrides.
     if not _has_flag(argv, "--model_name"):
-        argv += ["--model_name", "Qwen/Qwen3.5-4B-Instruct"]
+        argv += ["--model_name", "Qwen/Qwen3.5-4B"]
     if not _has_flag(argv, "--output_dir"):
         argv += ["--output_dir", "distilled-qwen-3_5-4b"]
     if not _has_flag(argv, "--model_dtype"):
