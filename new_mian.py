@@ -247,7 +247,9 @@ def tokenize_fn(tokenizer, max_length: int):
     return _tokenize
 
 
-def create_model(model_name: str, use_4bit: bool, model_dtype: str):
+def create_model(
+    model_name: str, use_4bit: bool, model_dtype: str, gradient_checkpointing: bool
+):
     quant_config: Optional[BitsAndBytesConfig] = None
     if use_4bit:
         quant_config = BitsAndBytesConfig(
@@ -290,6 +292,9 @@ def create_model(model_name: str, use_4bit: bool, model_dtype: str):
         task_type="CAUSAL_LM",
     )
     model = get_peft_model(model, peft_config)
+    if gradient_checkpointing:
+        model.enable_input_require_grads()
+        model.gradient_checkpointing_enable()
     return model
 
 
@@ -415,6 +420,11 @@ def parse_args():
         default=1.0,
         help="梯度裁剪阈值；默认 1.0 以提升数值稳定性",
     )
+    parser.add_argument(
+        "--no_gradient_checkpointing",
+        action="store_true",
+        help="关闭梯度检查点；默认开启以节省显存（Qwen3.5+长序列+LoRA 易 OOM 时必开）",
+    )
     return parser.parse_args()
 
 
@@ -494,10 +504,14 @@ def main():
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.truncation_side = "left"
     print(f"  - model_dtype: {args.model_dtype}")
+    use_gc = not args.no_gradient_checkpointing
+    if use_gc:
+        print("  - gradient_checkpointing: 已开启（降低显存）")
     model = create_model(
         pretrained,
         use_4bit=args.use_4bit,
         model_dtype=args.model_dtype,
+        gradient_checkpointing=use_gc,
     )
     model.print_trainable_parameters()
 
@@ -546,6 +560,7 @@ def main():
         bf16=False,
         fp16=False,
         max_grad_norm=args.max_grad_norm,
+        gradient_checkpointing=use_gc,
         save_total_limit=3,
         load_best_model_at_end=True,
         metric_for_best_model="eval_loss",
