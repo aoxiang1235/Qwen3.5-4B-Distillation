@@ -1,7 +1,15 @@
 #!/usr/bin/env python3
 """
-Qwen3.5-4B + LoRA 的 JSONL 监督微调：instruction/content → prompt，output(JSON)→ assistant，
-仅在回复段计 loss。默认魔搭拉基座。短跑/调参用命令行；nohup 建议: PYTHONUNBUFFERED=1 python3 -u new_mian.py
+Qwen3.5-4B 监督微调（SFT）训练脚本，本质是「用 JSONL 里的目标输出」做因果语言模型训练。
+
+训练方法简述：
+- 基座：Qwen3.5-4B，默认从魔搭 ModelScope 拉取/复用本地缓存，也可用 --model_source huggingface 或本机目录。
+- 只训练 LoRA 适配器（r=16, alpha=32），全参冻结，省显存、不易灾难性遗忘。
+- 将 instruction/content 拼成 prompt，只在「助手回复」段计算 loss（其余 token 的 labels 为 -100）；可选梯度检查点降显存。
+- HuggingFace Trainer 做反向与日志；nohup 到文件时建议: PYTHONUNBUFFERED=1 python3 -u new_mian.py ...
+
+仅支持 JSONL 数据入口：每行 instruction / content / output 字段。
+若本机已有完整基座，把目录传给 --model_name 可跳过下载。
 """
 
 import argparse
@@ -23,14 +31,6 @@ from transformers import (
     Trainer,
     TrainingArguments,
 )
-
-SYSTEM = "你是一个严谨的结构化信息抽取助手。"
-LORA_TARGET = ("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj")
-DTYPE_MAP = {"float16": torch.float16, "float32": torch.float32}
-# Transformers 4/5 参数名差异，启动时各查一次
-_SIG_TA = inspect.signature(TrainingArguments.__init__).parameters
-_SIG_TR = inspect.signature(Trainer.__init__).parameters
-
 
 @dataclass
 class DistillExample:
@@ -54,27 +54,37 @@ def load_jsonl(path: str) -> List[Dict]:
 
 
 def _validate_output_schema(output: object, row_idx: int) -> None:
-    def _err(msg: str) -> None:
-        raise ValueError(f"第 {row_idx} 条: {msg}")
-
     if not isinstance(output, dict):
-        _err("output 须为 JSON object。")
-    miss = {"is_beauty", "reasoning", "relationships"} - set(output)
-    if miss:
-        _err(f"output 缺字段: {sorted(miss)}")
+        raise ValueError(f"第 {row_idx} 条样本 output 必须是 JSON object。")
+
+    required_keys = {"is_beauty", "reasoning", "relationships"}
+    missing = required_keys - set(output.keys())
+    if missing:
+        raise ValueError(
+            f"第 {row_idx} 条样本 output 缺少字段: {sorted(missing)}。"
+        )
+
     if not isinstance(output["is_beauty"], bool):
-        _err("is_beauty 须为 bool")
+        raise ValueError(f"第 {row_idx} 条样本 output.is_beauty 必须是 boolean。")
     if not isinstance(output["reasoning"], str):
-        _err("reasoning 须为 str")
-    rels = output["relationships"]
-    if not isinstance(rels, list):
-        _err("relationships 须为 array")
-    for j, rel in enumerate(rels):
+        raise ValueError(f"第 {row_idx} 条样本 output.reasoning 必须是 string。")
+    if not isinstance(output["relationships"], list):
+        raise ValueError(f"第 {row_idx} 条样本 output.relationships 必须是 array。")
+
+    for rel_idx, rel in enumerate(output["relationships"]):
         if not isinstance(rel, dict):
-            _err(f"relationships[{j}] 须为 object")
+            raise ValueError(
+                f"第 {row_idx} 条样本 output.relationships[{rel_idx}] 必须是 object。"
+            )
         for k in ("brand_text", "start", "end"):
-            if k not in rel or not isinstance(rel[k], str):
-                _err(f"relationships[{j}].{k} 须为 string")
+            if k not in rel:
+                raise ValueError(
+                    f"第 {row_idx} 条样本 output.relationships[{rel_idx}] 缺少字段 {k}。"
+                )
+            if not isinstance(rel[k], str):
+                raise ValueError(
+                    f"第 {row_idx} 条样本 output.relationships[{rel_idx}].{k} 必须是 string。"
+                )
 
 
 def build_examples_from_json(records: Iterable[Dict]) -> List[DistillExample]:
@@ -96,28 +106,59 @@ def build_examples_from_json(records: Iterable[Dict]) -> List[DistillExample]:
     return examples
 
 
-def _collate_causal(tokenizer) -> Any:
-    pad = tokenizer.pad_token_id or 0
+def format_chat(example: DistillExample, tokenizer) -> str:
+    # Qwen chat 模板，训练目标放在 assistant 回复里。
+    messages = [
+        {"role": "system", "content": "你是一个严谨的结构化信息抽取助手。"},
+        {
+            "role": "user",
+            "content": f"指令：{example.instruction}\n\n文本：{example.input_text}",
+        },
+        {"role": "assistant", "content": example.output_text},
+    ]
+    return tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=False,
+    )
 
-    def _batch(features: List[Dict[str, List[int]]]) -> Dict[str, torch.Tensor]:
-        def col(k: str) -> List[torch.Tensor]:
-            return [torch.tensor(f[k], dtype=torch.long) for f in features]
 
-        am = torch.nn.utils.rnn.pad_sequence(
-            col("attention_mask"), batch_first=True, padding_value=0
+@dataclass
+class DataCollatorForCausalLMCustom:
+    """batch 内 padding；仅将 padding（attention_mask==0）标为 -100，避免 pad==eos 时误 mask。"""
+
+    tokenizer: Any
+
+    def __call__(self, features: List[Dict[str, List[int]]]) -> Dict[str, torch.Tensor]:
+        input_ids = [torch.tensor(f["input_ids"], dtype=torch.long) for f in features]
+        attention_mask = [torch.tensor(f["attention_mask"], dtype=torch.long) for f in features]
+        labels = [torch.tensor(f["labels"], dtype=torch.long) for f in features]
+        pad_id = self.tokenizer.pad_token_id
+        if pad_id is None:
+            pad_id = 0
+        input_ids_t = torch.nn.utils.rnn.pad_sequence(
+            input_ids, batch_first=True, padding_value=pad_id
         )
-        lab = torch.nn.utils.rnn.pad_sequence(
-            col("labels"), batch_first=True, padding_value=-100
-        ).masked_fill(am == 0, -100)
+        attention_mask_t = torch.nn.utils.rnn.pad_sequence(
+            attention_mask, batch_first=True, padding_value=0
+        )
+        labels_t = torch.nn.utils.rnn.pad_sequence(
+            labels, batch_first=True, padding_value=-100
+        )
+        labels_t = labels_t.masked_fill(attention_mask_t == 0, -100)
         return {
-            "input_ids": torch.nn.utils.rnn.pad_sequence(
-                col("input_ids"), batch_first=True, padding_value=pad
-            ),
-            "attention_mask": am,
-            "labels": lab,
+            "input_ids": input_ids_t,
+            "attention_mask": attention_mask_t,
+            "labels": labels_t,
         }
 
-    return _batch
+
+def _lcp_token_len(a: List[int], b: List[int]) -> int:
+    n = min(len(a), len(b))
+    i = 0
+    while i < n and a[i] == b[i]:
+        i += 1
+    return i
 
 
 def split_dataset(
@@ -137,44 +178,75 @@ def split_dataset(
 
 
 def tokenize_fn(tokenizer, max_length: int):
+    system_content = "你是一个严谨的结构化信息抽取助手。"
+
     def _tokenize(batch):
-        out_ids, out_m, out_l = [], [], []
-        for ins, inp, otxt in zip(
-            batch["instruction"], batch["input_text"], batch["output_text"]
+        input_ids_list: List[List[int]] = []
+        attention_mask_list: List[List[int]] = []
+        labels_list: List[List[int]] = []
+
+        for ins, inp, out in zip(
+            batch["instruction"],
+            batch["input_text"],
+            batch["output_text"],
         ):
-            u = f"指令：{ins}\n\n文本：{inp}"
-            sys_usr = [
-                {"role": "system", "content": SYSTEM},
-                {"role": "user", "content": u},
+            ex = DistillExample(ins, inp, out)
+            messages_full = [
+                {"role": "system", "content": system_content},
+                {
+                    "role": "user",
+                    "content": f"指令：{ex.instruction}\n\n文本：{ex.input_text}",
+                },
+                {"role": "assistant", "content": ex.output_text},
+            ]
+            messages_prompt = [
+                {"role": "system", "content": system_content},
+                {
+                    "role": "user",
+                    "content": f"指令：{ex.instruction}\n\n文本：{ex.input_text}",
+                },
             ]
             full_text = tokenizer.apply_chat_template(
-                sys_usr + [{"role": "assistant", "content": otxt}],
+                messages_full,
                 tokenize=False,
                 add_generation_prompt=False,
             )
-            p_ids = tokenizer.apply_chat_template(
-                sys_usr, tokenize=True, add_generation_prompt=True
+            prompt_ids = tokenizer.apply_chat_template(
+                messages_prompt,
+                tokenize=True,
+                add_generation_prompt=True,
             )
-            full_u = tokenizer(full_text, truncation=False)["input_ids"]
+            full_no_trunc = tokenizer(full_text, truncation=False)["input_ids"]
             enc = tokenizer(
-                full_text, truncation=True, max_length=max_length, padding=False
+                full_text,
+                truncation=True,
+                max_length=max_length,
+                padding=False,
             )
-            ids, attn = enc["input_ids"], enc["attention_mask"]
-            if len(full_u) >= len(p_ids) and full_u[: len(p_ids)] == p_ids:
-                a0 = len(p_ids)
+            ids = enc["input_ids"]
+            attn = enc["attention_mask"]
+            if len(full_no_trunc) >= len(prompt_ids) and full_no_trunc[
+                : len(prompt_ids)
+            ] == prompt_ids:
+                assistant_start_full = len(prompt_ids)
             else:
-                a0, n = 0, min(len(p_ids), len(full_u))
-                while a0 < n and p_ids[a0] == full_u[a0]:
-                    a0 += 1
-            c = max(0, len(full_u) - len(ids))
-            a_in = max(0, a0 - c)
+                assistant_start_full = _lcp_token_len(prompt_ids, full_no_trunc)
+            cut = max(0, len(full_no_trunc) - len(ids))
+            assistant_start_in_seq = max(0, assistant_start_full - cut)
+
             labels = list(ids)
-            for i in range(min(a_in, len(labels))):
+            for i in range(min(assistant_start_in_seq, len(labels))):
                 labels[i] = -100
-            out_ids.append(ids)
-            out_m.append(attn)
-            out_l.append(labels)
-        return {"input_ids": out_ids, "attention_mask": out_m, "labels": out_l}
+
+            input_ids_list.append(ids)
+            attention_mask_list.append(attn)
+            labels_list.append(labels)
+
+        return {
+            "input_ids": input_ids_list,
+            "attention_mask": attention_mask_list,
+            "labels": labels_list,
+        }
 
     return _tokenize
 
@@ -184,9 +256,6 @@ def create_model(
     use_4bit: bool,
     model_dtype: str,
     gradient_checkpointing: bool = True,
-    lora_r: int = 16,
-    lora_alpha: int = 32,
-    lora_dropout: float = 0.05,
 ):
     quant_config: Optional[BitsAndBytesConfig] = None
     if use_4bit:
@@ -197,12 +266,16 @@ def create_model(
             bnb_4bit_use_double_quant=True,
         )
 
-    if model_dtype not in DTYPE_MAP:
+    dtype_map = {
+        "float16": torch.float16,
+        "float32": torch.float32,
+    }
+    if model_dtype not in dtype_map:
         raise ValueError(f"不支持的 --model_dtype: {model_dtype}")
 
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
-        torch_dtype=DTYPE_MAP[model_dtype],
+        torch_dtype=dtype_map[model_dtype],
         quantization_config=quant_config,
         device_map="auto",
     )
@@ -210,10 +283,18 @@ def create_model(
         model = prepare_model_for_kbit_training(model)
 
     peft_config = LoraConfig(
-        r=lora_r,
-        lora_alpha=lora_alpha,
-        lora_dropout=lora_dropout,
-        target_modules=list(LORA_TARGET),
+        r=16,
+        lora_alpha=32,
+        lora_dropout=0.05,
+        target_modules=[
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+            "gate_proj",
+            "up_proj",
+            "down_proj",
+        ],
         bias="none",
         task_type="CAUSAL_LM",
     )
@@ -229,92 +310,141 @@ def create_model(
 
 
 def _aligned_logging_steps(requested: int, grad_accum: int) -> int:
-    base = max(1, requested) if requested > 0 else 20
+    """与 gradient_accumulation 对齐，减少 Trainer 在累积边界上打出 loss=0 的误导日志。"""
+    if requested > 0:
+        base = max(1, requested)
+    else:
+        base = 20
     ga = max(1, grad_accum)
-    return max(ga, ((base + ga - 1) // ga) * ga)
+    aligned = ((base + ga - 1) // ga) * ga
+    return max(ga, aligned)
 
 
-def _filter_and_stats(ds, min_tok: int, name: str):
-    n0 = len(ds)
+def _filter_weak_supervision(ds, min_tokens: int, split_name: str):
+    """去掉 labels 全为 -100 或有效 token 过少的样本。"""
 
-    def _ok(ex: Dict[str, List[int]]) -> bool:
-        return sum(1 for t in ex["labels"] if t != -100) >= min_tok
+    def _ok(example: Dict[str, List[int]]) -> bool:
+        return sum(1 for t in example["labels"] if t != -100) >= min_tokens
 
-    ds = ds.filter(_ok)
-    n = len(ds)
-    print(f"  - {name}: 弱监督 {n0}->{n} (min_tokens={min_tok})")
-    if n < 10:
+    n_before = len(ds)
+    out = ds.filter(_ok)
+    n_after = len(out)
+    print(f"  - {split_name}: 过滤弱监督样本 {n_before} -> {n_after} (min_supervised_tokens={min_tokens})")
+    if n_after < 10:
         raise RuntimeError(
-            f"{name} 有效样本<10，降 --min_supervised_tokens 或查数据/模板"
+            f"{split_name} 过滤后样本不足 10 条，请降低 --min_supervised_tokens 或检查截断/模板。"
         )
-    cnts = sorted(sum(1 for t in r["labels"] if t != -100) for r in ds)
-    m = len(cnts)
+    return out
+
+
+def _print_supervision_stats(ds, split_name: str):
+    counts = [sum(1 for t in row["labels"] if t != -100) for row in ds]
+    if not counts:
+        raise RuntimeError(f"{split_name} 没有可用样本。")
+    counts_sorted = sorted(counts)
+    n = len(counts_sorted)
+    p50 = counts_sorted[n // 2]
+    p90 = counts_sorted[min(n - 1, int(n * 0.9))]
+    min_v = counts_sorted[0]
+    max_v = counts_sorted[-1]
+    mean_v = sum(counts_sorted) / n
     print(
-        f"  - {name} 监督 token: min={cnts[0]} p50={cnts[m // 2]} "
-        f"p90={cnts[min(m - 1, int(m * 0.9))]} max={cnts[-1]} mean={sum(cnts) / m:.1f}"
+        f"  - {split_name} 监督 token 统计: min={min_v}, p50={p50}, p90={p90}, max={max_v}, mean={mean_v:.1f}"
     )
-    return ds
 
 
-def parse_args() -> argparse.Namespace:
-    ap = argparse.ArgumentParser(description="Qwen3.5-4B 蒸馏训练")
-    for name, spec in (
-        ("--train_jsonl", {"default": "", "help": "训练 JSONL（必填）"}),
-        ("--val_jsonl", {"default": "", "help": "验证 JSONL；空则按 val_ratio 切分"}),
-        (
-            "--model_name",
-            {"default": "Qwen/Qwen3.5-4B", "help": "魔搭/HF id 或本地含 config.json 的目录"},
-        ),
-        (
-            "--model_source",
-            {
-                "choices": ["modelscope", "huggingface"],
-                "default": "modelscope",
-                "help": "基座来源",
-            },
-        ),
-        ("--modelscope_cache", {"default": "", "help": "魔搭缓存目录，默认同目录 .modelscope"}),
-        (
-            "--model_dtype",
-            {"choices": ["float16", "float32"], "default": "float32", "help": "权重精度"},
-        ),
-        ("--output_dir", {"default": "./distilled-qwen", "help": "输出目录"}),
-        ("--max_length", {"type": int, "default": 1024}),
-        ("--epochs", {"type": float, "default": 1.0}),
-        ("--lr", {"type": float, "default": 1e-6}),
-        ("--batch_size", {"type": int, "default": 2}),
-        ("--grad_accum", {"type": int, "default": 8}),
-        ("--val_ratio", {"type": float, "default": 0.02}),
-        ("--seed", {"type": int, "default": 42}),
-        ("--use_4bit", {"action": "store_true"}),
-        ("--max_steps", {"type": int, "default": -1, "help": "限制步数，-1=按 epoch"}),
-        (
-            "--min_supervised_tokens",
-            {"type": int, "default": 2, "help": "非 -100 的 label 数下限"},
-        ),
-        (
-            "--logging_steps",
-            {"type": int, "default": 0, "help": "0=自动与 grad_accum 对齐"},
-        ),
-        ("--max_grad_norm", {"type": float, "default": 1.0}),
-        ("--no_gradient_checkpointing", {"action": "store_true"}),
-        ("--lora_r", {"type": int, "default": 16}),
-        ("--lora_alpha", {"type": int, "default": 32}),
-        ("--lora_dropout", {"type": float, "default": 0.05}),
-        ("--eval_steps", {"type": int, "default": 100, "help": "评估间隔（optimizer step）"}),
-        ("--save_steps", {"type": int, "default": 0, "help": "0=同 eval_steps"}),
-        ("--warmup_ratio", {"type": float, "default": 0.03}),
-        ("--no_load_best_at_end", {"action": "store_true"}),
-    ):
-        kwargs = dict(spec)
-        if kwargs.get("action") != "store_true" and "type" not in kwargs:
-            kwargs["type"] = str
-        ap.add_argument(name, **kwargs)
-    return ap.parse_args()
+def parse_args():
+    parser = argparse.ArgumentParser(description="Qwen3.5-4B 蒸馏训练")
+    parser.add_argument(
+        "--train_jsonl",
+        type=str,
+        default="",
+        help="训练集 JSONL 路径（必填）",
+    )
+    parser.add_argument(
+        "--val_jsonl",
+        type=str,
+        default="",
+        help="验证集 JSONL 路径（可选，不传则按 val_ratio 从 train 切分）",
+    )
+    parser.add_argument(
+        "--model_name",
+        type=str,
+        default="Qwen/Qwen3.5-4B",
+        help="魔搭 / HF 的模型 id，或本机已下载目录（见 --model_source）",
+    )
+    parser.add_argument(
+        "--model_source",
+        type=str,
+        choices=["modelscope", "huggingface"],
+        default="modelscope",
+        help="modelscope=从魔搭 ModelScope 下载/复用缓存；huggingface=从 Hugging Face Hub 拉取",
+    )
+    parser.add_argument(
+        "--modelscope_cache",
+        type=str,
+        default="",
+        help="ModelScope 缓存根目录；留空则使用 <cwd>/.modelscope 或环境变量 MODELSCOPE_CACHE",
+    )
+    parser.add_argument(
+        "--model_dtype",
+        type=str,
+        choices=["float16", "float32"],
+        default="float32",
+        help="模型权重加载精度；P100 上为避免 loss 数值爆炸，默认用 float32",
+    )
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default="./distilled-qwen",
+        help="输出目录",
+    )
+    parser.add_argument("--max_length", type=int, default=1024)
+    parser.add_argument("--epochs", type=float, default=1.0)
+    parser.add_argument("--lr", type=float, default=1e-6)
+    parser.add_argument("--batch_size", type=int, default=2)
+    parser.add_argument("--grad_accum", type=int, default=8)
+    parser.add_argument("--val_ratio", type=float, default=0.02)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--use_4bit", action="store_true")
+    parser.add_argument(
+        "--max_steps",
+        type=int,
+        default=-1,
+        help="仅训练若干 step 即停（云端冒烟用）；-1 表示按 num_train_epochs 跑满",
+    )
+    parser.add_argument(
+        "--min_supervised_tokens",
+        type=int,
+        default=2,
+        help="每条样本至少要有多少个非 -100 的 label token，否则丢弃（避免 loss=0 / 反传异常）",
+    )
+    parser.add_argument(
+        "--logging_steps",
+        type=int,
+        default=0,
+        help="日志步长；0 表示自动取不小于 20 且为 grad_accum 倍数的值，与梯度累积对齐",
+    )
+    parser.add_argument(
+        "--max_grad_norm",
+        type=float,
+        default=1.0,
+        help="梯度裁剪阈值；默认 1.0 以提升数值稳定性",
+    )
+    parser.add_argument(
+        "--no_gradient_checkpointing",
+        action="store_true",
+        help="关闭梯度检查点（默认开启以降低显存；关闭可略快但易 OOM）",
+    )
+    return parser.parse_args()
 
 
 def resolve_pretrained_path(args) -> str:
-    """本地目录 / HuggingFace id / 魔搭 snapshot 路径之一。"""
+    """
+    将 --model_name 解析为可传给 from_pretrained 的路径或 id。
+    - 若本机目录下已有 config.json，则直接使用（不走魔搭 / HF 下载逻辑）。
+    - 否则按 --model_source 从魔搭或 HF 取权重。
+    """
     name = (args.model_name or "").strip()
     if not name:
         raise ValueError("请设置 --model_name。")
@@ -336,65 +466,14 @@ def resolve_pretrained_path(args) -> str:
     return snapshot_download(name, cache_dir=cache)
 
 
-def _estimate_max_opt_steps(args: argparse.Namespace, n_train: int) -> int:
-    if args.max_steps and args.max_steps > 0:
-        return int(args.max_steps)
-    ga = max(1, args.grad_accum)
-    per_ep = (n_train + args.batch_size * ga - 1) // max(1, args.batch_size * ga)
-    return int(per_ep * args.epochs)
-
-
-def _build_training_args(
-    args: argparse.Namespace, log_steps: int, load_best: bool
-) -> TrainingArguments:
-    ev = (
-        {"eval_strategy": "steps"}
-        if "eval_strategy" in _SIG_TA
-        else {"evaluation_strategy": "steps"}
-    )
-    extra: Dict[str, Any] = {"disable_tqdm": True}
-    if "logging_first_step" in _SIG_TA:
-        extra["logging_first_step"] = True
-    if "log_level" in _SIG_TA:
-        extra["log_level"] = "info"
-    save_steps = args.save_steps if args.save_steps > 0 else args.eval_steps
-    return TrainingArguments(
-        output_dir=args.output_dir,
-        num_train_epochs=args.epochs,
-        max_steps=args.max_steps if args.max_steps > 0 else -1,
-        learning_rate=args.lr,
-        per_device_train_batch_size=args.batch_size,
-        per_device_eval_batch_size=args.batch_size,
-        gradient_accumulation_steps=args.grad_accum,
-        **ev,
-        eval_steps=args.eval_steps,
-        save_steps=save_steps,
-        logging_steps=log_steps,
-        warmup_ratio=args.warmup_ratio,
-        bf16=False,
-        fp16=False,
-        max_grad_norm=args.max_grad_norm,
-        save_total_limit=3,
-        load_best_model_at_end=load_best,
-        metric_for_best_model="eval_loss",
-        greater_is_better=False,
-        report_to="none",
-        **extra,
-    )
-
-
 def main():
     args = parse_args()
-    if args.lora_r < 1:
-        raise ValueError("--lora_r 须 >= 1")
-    if not 0.0 <= args.lora_dropout < 1.0:
-        raise ValueError("--lora_dropout 须在 [0, 1) 内")
     random.seed(args.seed)
     torch.manual_seed(args.seed)
 
     print("[1/5] 读取数据")
     if not args.train_jsonl:
-        raise ValueError("请传 --train_jsonl。")
+        raise ValueError("已禁用 Excel 入口，请传 --train_jsonl。")
     if not os.path.exists(args.train_jsonl):
         raise FileNotFoundError(f"找不到训练集 JSONL: {args.train_jsonl}")
     train_records = load_jsonl(args.train_jsonl)
@@ -441,9 +520,6 @@ def main():
         use_4bit=args.use_4bit,
         model_dtype=args.model_dtype,
         gradient_checkpointing=not args.no_gradient_checkpointing,
-        lora_r=args.lora_r,
-        lora_alpha=args.lora_alpha,
-        lora_dropout=args.lora_dropout,
     )
     model.print_trainable_parameters()
 
@@ -453,12 +529,14 @@ def main():
         batched=True,
         remove_columns=dataset["train"].column_names,
     )
-    tokenized["train"] = _filter_and_stats(
+    tokenized["train"] = _filter_weak_supervision(
         tokenized["train"], args.min_supervised_tokens, "train"
     )
-    tokenized["validation"] = _filter_and_stats(
+    tokenized["validation"] = _filter_weak_supervision(
         tokenized["validation"], args.min_supervised_tokens, "validation"
     )
+    _print_supervision_stats(tokenized["train"], "train")
+    _print_supervision_stats(tokenized["validation"], "validation")
 
     log_steps = _aligned_logging_steps(args.logging_steps, args.grad_accum)
     if args.logging_steps > 0 and log_steps != args.logging_steps:
@@ -467,23 +545,53 @@ def main():
         )
 
     print("[5/5] 开始训练")
+    # 便于 nohup 日志：行缓冲 + 关闭 tqdm，避免 loss 行被 \r 进度条盖掉
     if hasattr(sys.stdout, "reconfigure"):
         try:
             sys.stdout.reconfigure(line_buffering=True)  # type: ignore[union-attr]
         except (OSError, ValueError, AttributeError):
             pass
-    n_tr = len(tokenized["train"])
-    max_opt = _estimate_max_opt_steps(args, n_tr)
-    load_best = not args.no_load_best_at_end
-    if load_best and max_opt > 0 and args.eval_steps > max_opt:
-        print(
-            f"  - 总步数约 {max_opt} < eval_steps={args.eval_steps}，已关闭 load_best_model_at_end"
-        )
-        load_best = False
-    training_args = _build_training_args(args, log_steps, load_best)
-    _tok = (
+    # Transformers 5.x: evaluation_strategy was renamed to eval_strategy.
+    _ta = inspect.signature(TrainingArguments.__init__).parameters
+    _eval_kw = (
+        {"eval_strategy": "steps"}
+        if "eval_strategy" in _ta
+        else {"evaluation_strategy": "steps"}
+    )
+    _log_extra: Dict[str, Any] = {"disable_tqdm": True}
+    if "logging_first_step" in _ta:
+        _log_extra["logging_first_step"] = True
+    if "log_level" in _ta:
+        _log_extra["log_level"] = "info"
+    training_args = TrainingArguments(
+        output_dir=args.output_dir,
+        num_train_epochs=args.epochs,
+        max_steps=args.max_steps if args.max_steps > 0 else -1,
+        learning_rate=args.lr,
+        per_device_train_batch_size=args.batch_size,
+        per_device_eval_batch_size=args.batch_size,
+        gradient_accumulation_steps=args.grad_accum,
+        **_eval_kw,
+        eval_steps=100,
+        save_steps=100,
+        logging_steps=log_steps,
+        warmup_ratio=0.03,
+        bf16=False,
+        fp16=False,
+        max_grad_norm=args.max_grad_norm,
+        save_total_limit=3,
+        load_best_model_at_end=True,
+        metric_for_best_model="eval_loss",
+        greater_is_better=False,
+        report_to="none",
+        **_log_extra,
+    )
+
+    # Transformers 5.x: Trainer 使用 processing_class 替代 tokenizer 参数名。
+    _trp = inspect.signature(Trainer.__init__).parameters
+    _tok_kw = (
         {"processing_class": tokenizer}
-        if "processing_class" in _SIG_TR
+        if "processing_class" in _trp
         else {"tokenizer": tokenizer}
     )
     trainer = Trainer(
@@ -491,10 +599,12 @@ def main():
         args=training_args,
         train_dataset=tokenized["train"],
         eval_dataset=tokenized["validation"],
-        data_collator=_collate_causal(tokenizer),
-        **_tok,
+        **_tok_kw,
+        data_collator=DataCollatorForCausalLMCustom(tokenizer=tokenizer),
     )
     trainer.train()
+
+    os.makedirs(args.output_dir, exist_ok=True)
     trainer.save_model(args.output_dir)
     tokenizer.save_pretrained(args.output_dir)
     print(f"训练完成，模型已保存到: {args.output_dir}")
