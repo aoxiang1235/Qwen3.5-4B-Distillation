@@ -4,20 +4,16 @@ set -euo pipefail
 PROJECT=~/Qwen3.5-4B-Distillation-github-smoke
 VENV=~/Qwen3.5-4B-Distillation/.venv
 PORT=8000
-MODEL_DIR="$PROJECT/training_runs/best_B_full_20260425_184108_merged"
-LOG="$PROJECT/qwen35_full_http_8000.log"
-PID_FILE="$PROJECT/qwen35_full_http_8000.pid"
+BASE_MODEL="Qwen/Qwen3.5-4B"
+ADAPTER_DIR="$PROJECT/training_runs/best_B_full_20260425_184108_out"
+LOG="$PROJECT/strict_json_8000.log"
+PID_FILE="$PROJECT/strict_json_8000.pid"
 
 cd "$PROJECT"
 source "$VENV/bin/activate"
 
-if [ ! -f "$MODEL_DIR/config.json" ]; then
-  echo "[error] full model missing: $MODEL_DIR/config.json"
-  exit 1
-fi
-
-if lsof -iTCP:"$PORT" -sTCP:LISTEN -t >/dev/null 2>&1; then
-  echo "[error] port $PORT already in use"
+if [ ! -f "$ADAPTER_DIR/adapter_config.json" ]; then
+  echo "[error] lora adapter missing: $ADAPTER_DIR/adapter_config.json"
   exit 1
 fi
 
@@ -30,15 +26,34 @@ if [ -f "$PID_FILE" ]; then
   fi
 fi
 
-nohup python3 -u serve_qwen35_full_http.py \
+lsof -iTCP:"$PORT" -sTCP:LISTEN -t | xargs -r kill || true
+sleep 1
+
+nohup python3 -u serve_lora_http_strict_json.py \
   --host 0.0.0.0 \
   --port "$PORT" \
-  --model_path "$MODEL_DIR" \
+  --base_model "$BASE_MODEL" \
+  --adapter_path "$ADAPTER_DIR" \
   --max_new_tokens 256 \
+  --retry_max_new_tokens 384 \
   > "$LOG" 2>&1 &
 
 NEW_PID=$!
 echo "$NEW_PID" > "$PID_FILE"
+sleep 2
+if ! kill -0 "$NEW_PID" >/dev/null 2>&1; then
+  echo "[error] service exited early, check log: $LOG"
+  exit 1
+fi
+
+for i in 1 2 3 4 5 6; do
+  if curl -sS "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then
+    break
+  fi
+  sleep 2
+done
+
 echo "PID=$NEW_PID"
 echo "LOG=$LOG"
-echo "MODEL=$MODEL_DIR"
+echo "BASE_MODEL=$BASE_MODEL"
+echo "ADAPTER=$ADAPTER_DIR"

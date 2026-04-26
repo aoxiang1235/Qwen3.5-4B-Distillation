@@ -1,31 +1,35 @@
 #!/usr/bin/env python3
 """
 LoRA HTTP inference server (strict JSON mode).
-
-Purpose:
-- Keep existing serving scripts untouched.
-- Enforce strict structured output for extraction use cases.
-- Reduce "thinking process" leakage and JSON parse failures.
+Fixed: JSON parsing, thinking process removal, output normalization, retry logic.
 """
-
 import argparse
-import ast
 import json
 import time
+import re
+import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, Optional
-
 import torch
 from peft import PeftModel
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-
 def _extract_first_json_object(text: str) -> Optional[Dict[str, Any]]:
-    idx = text.find("{")
-    if idx < 0:
+    text = text.strip()
+    first = text.find("{")
+    last = text.rfind("}")
+    if first < 0 or last < first:
         return None
+    cand = text[first:last+1]
+    cand = re.sub(r",\s*}", "}", cand)
+    cand = re.sub(r",\s*]", "]", cand)
+    try:
+        return json.loads(cand)
+    except Exception:
+        pass
     decoder = json.JSONDecoder()
-    while idx >= 0 and idx < len(text):
+    idx = first
+    while idx <= last:
         try:
             obj, _ = decoder.raw_decode(text[idx:])
             if isinstance(obj, dict):
@@ -35,60 +39,44 @@ def _extract_first_json_object(text: str) -> Optional[Dict[str, Any]]:
         idx = text.find("{", idx + 1)
     return None
 
-
 def _normalize_output(obj: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     if not isinstance(obj, dict):
         return None
-    out: Dict[str, Any] = {
-        "is_beauty": bool(obj.get("is_beauty", False)),
-        "reasoning": str(obj.get("reasoning", "")),
+    out = {
+        "is_beauty": False,
+        "reasoning": "",
         "relationships": [],
     }
+    out["is_beauty"] = bool(obj.get("is_beauty"))
+    reasoning = str(obj.get("reasoning", "")).strip()
+    out["reasoning"] = reasoning if reasoning else "Extracted beauty brands"
     rels = obj.get("relationships", [])
     if isinstance(rels, list):
-        for rel in rels:
-            if not isinstance(rel, dict):
+        valid = []
+        for r in rels:
+            if not isinstance(r, dict):
                 continue
-            brand = str(rel.get("brand_text", "")).strip()
-            start = str(rel.get("start", "")).strip()
-            end = str(rel.get("end", "")).strip()
-            if not brand:
-                continue
-            out["relationships"].append(
-                {"brand_text": brand, "start": start, "end": end}
-            )
+            b = str(r.get("brand_text", "")).strip()
+            s = str(r.get("start", "")).strip()
+            e = str(r.get("end", "")).strip()
+            if b:
+                valid.append({"brand_text": b, "start": s, "end": e})
+        out["relationships"] = valid
     return out
 
-
-def _parse_maybe_python_dict(text: str) -> Optional[Dict[str, Any]]:
-    try:
-        obj = ast.literal_eval(text)
-    except Exception:
-        return None
-    if isinstance(obj, dict):
-        return obj
-    return None
-
-
-def build_parser() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="LoRA HTTP inference server (strict JSON)")
+def build_parser():
+    parser = argparse.ArgumentParser(description="LoRA HTTP strict JSON server")
     parser.add_argument("--host", type=str, default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
-    parser.add_argument("--base_model", type=str, default="Qwen/Qwen2.5-3B-Instruct")
-    parser.add_argument(
-        "--adapter_path",
-        type=str,
-        default="distilled-qwen-f32_full_20260424",
-    )
-    parser.add_argument("--max_new_tokens", type=int, default=1024)
-    parser.add_argument("--retry_max_new_tokens", type=int, default=1536)
+    parser.add_argument("--base_model", type=str, default="Qwen/Qwen3.5-4B")
+    parser.add_argument("--adapter_path", type=str, default="distilled-qwen-f32_full_20260424")
+    parser.add_argument("--max_new_tokens", type=int, default=256)
+    parser.add_argument("--retry_max_new_tokens", type=int, default=384)
     return parser.parse_args()
 
-
-def create_app_state(args: argparse.Namespace) -> Dict[str, Any]:
-    print(f"[load] base_model={args.base_model}")
-    print(f"[load] adapter={args.adapter_path}")
-    print("[load] mode=strict_json")
+def create_app_state(args):
+    print(f"[load] base={args.base_model}")
+    print(f"[load] lora={args.adapter_path}")
     tokenizer = AutoTokenizer.from_pretrained(args.base_model, use_fast=False)
     model = AutoModelForCausalLM.from_pretrained(
         args.base_model,
@@ -97,147 +85,117 @@ def create_app_state(args: argparse.Namespace) -> Dict[str, Any]:
     )
     model = PeftModel.from_pretrained(model, args.adapter_path)
     model.eval()
-    print("[load] model ready")
+    print("[load] model ready ✅")
     return {"tokenizer": tokenizer, "model": model, "args": args}
 
-
-def make_handler(state: Dict[str, Any]):
-    tokenizer = state["tokenizer"]
+def make_handler(state):
+    tok = state["tokenizer"]
     model = state["model"]
     args = state["args"]
 
     class Handler(BaseHTTPRequestHandler):
-        def _json_response(self, status: int, payload: Dict[str, Any]) -> None:
-            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-            self.send_response(status)
+        def _json(self, code, data):
+            b = json.dumps(data, ensure_ascii=False).encode("utf-8")
+            self.send_response(code)
             self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Content-Length", str(len(b)))
             self.end_headers()
-            self.wfile.write(body)
+            self.wfile.write(b)
 
-        def _generate_once(
-            self,
-            instruction: str,
-            content: str,
-            max_new_tokens: int,
-            force_no_thinking: bool,
-        ) -> Dict[str, Any]:
-            system_prompt = (
-                "你是一个严谨的结构化信息抽取助手。"
-                "Do not output analysis/thinking process. Output one valid JSON object only."
+        def _gen(self, instruction, content, max_new, force_clean):
+            sys_prompt = (
+                "你是专业结构化抽取助手。只输出合法JSON，禁止任何思考过程、分析、列表、markdown。"
+                "输出必须是单JSON对象，包含is_beauty, reasoning, relationships。"
             )
-            if force_no_thinking:
-                system_prompt += (
-                    " Never output 'Thinking Process', bullet points, or markdown."
-                )
-            user_prompt = (
-                f"指令：{instruction}\n\n文本：{content}\n\n"
-                "Only output one valid JSON object. "
-                "Start with '{' and end with '}'."
+            if force_clean:
+                sys_prompt += " 绝对禁止输出Thinking Process、解释、换行外多余符号。"
+            user = (
+                f"指令：{instruction}\n文本：{content}\n"
+                "只输出JSON，以{开头，以}结尾。"
             )
             messages = [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
+                {"role": "system", "content": sys_prompt},
+                {"role": "user", "content": user},
             ]
-            prompt = tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=True,
-            )
-            inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+            prompt = tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+            inputs = tok(prompt, return_tensors="pt").to(model.device)
             with torch.no_grad():
                 out = model.generate(
                     **inputs,
-                    max_new_tokens=max_new_tokens,
+                    max_new_tokens=max_new,
                     do_sample=False,
+                    temperature=0.0,
+                    top_p=1.0,
+                    num_beams=1,
+                    pad_token_id=tok.pad_token_id,
+                    eos_token_id=tok.eos_token_id,
                 )
-            text = tokenizer.decode(
-                out[0][inputs["input_ids"].shape[1] :], skip_special_tokens=True
-            ).strip()
-            parsed = None
+            text = tok.decode(out[0][inputs.input_ids.shape[1]:], skip_special_tokens=True).strip()
             try:
                 parsed = json.loads(text)
-            except Exception:
+            except:
                 parsed = _extract_first_json_object(text)
-                if parsed is None:
-                    parsed = _parse_maybe_python_dict(text)
             return {"text": text, "parsed": _normalize_output(parsed)}
 
-        def do_GET(self):  # noqa: N802
+        def do_GET(self):
             if self.path == "/health":
-                self._json_response(200, {"ok": True})
+                self._json(200, {"ok": True})
                 return
-            self._json_response(404, {"error": "not_found"})
+            self._json(404, {"error": "not_found"})
 
-        def do_POST(self):  # noqa: N802
+        def do_POST(self):
             if self.path != "/generate":
-                self._json_response(404, {"error": "not_found"})
+                self._json(404, {"error": "not_found"})
                 return
-            start_t = time.perf_counter()
+            st = time.perf_counter()
             try:
-                length = int(self.headers.get("Content-Length", "0"))
-                raw = self.rfile.read(length)
+                l = int(self.headers.get("Content-Length", "0"))
+                raw = self.rfile.read(l)
                 payload = json.loads(raw.decode("utf-8"))
-            except Exception as exc:
-                self._json_response(400, {"error": f"invalid_json: {exc}"})
+            except:
+                self._json(400, {"error": "invalid_json"})
                 return
-
-            instruction = str(payload.get("instruction", "")).strip()
-            content = str(payload.get("content", "")).strip()
-            if not instruction or not content:
-                self._json_response(
-                    400, {"error": "instruction and content are required"}
-                )
+            inst = str(payload.get("instruction", "")).strip()
+            cont = str(payload.get("content", "")).strip()
+            if not inst or not cont:
+                self._json(400, {"error": "need instruction and content"})
                 return
-
-            max_new_tokens = int(payload.get("max_new_tokens", args.max_new_tokens))
-            first = self._generate_once(
-                instruction=instruction,
-                content=content,
-                max_new_tokens=max_new_tokens,
-                force_no_thinking=False,
-            )
+            req_max_new = int(payload.get("max_new_tokens", args.max_new_tokens))
+            # Hard cap to avoid runaway generation latency.
+            max_new = min(req_max_new, args.max_new_tokens)
+            max_retries = 2
+            res = None
             retried = False
-            final_text = first["text"]
-            final_parsed = first["parsed"]
+            for i in range(max_retries):
+                cur_max = max_new if i == 0 else min(args.retry_max_new_tokens, max_new + 128)
+                temp = self._gen(inst, cont, cur_max, force_clean=(i>0))
+                if temp["parsed"] is not None:
+                    res = temp
+                    retried = (i>0)
+                    break
+            if not res:
+                res = {"text": "", "parsed": None}
+            elapsed = int((time.perf_counter()-st)*1000)
+            self._json(200, {
+                "ok": True,
+                "elapsed_ms": elapsed,
+                "retried": retried,
+                "output_text": res["text"],
+                "output_json": res["parsed"],
+            })
 
-            if final_parsed is None:
-                retried = True
-                second = self._generate_once(
-                    instruction=instruction,
-                    content=content,
-                    max_new_tokens=max(max_new_tokens, args.retry_max_new_tokens),
-                    force_no_thinking=True,
-                )
-                final_text = second["text"]
-                final_parsed = second["parsed"]
-
-            elapsed_ms = int((time.perf_counter() - start_t) * 1000)
-            self._json_response(
-                200,
-                {
-                    "ok": True,
-                    "elapsed_ms": elapsed_ms,
-                    "retried": retried,
-                    "output_text": final_text,
-                    "output_json": final_parsed,
-                },
-            )
-
-        def log_message(self, format: str, *args_) -> None:
-            return
+        def log_message(self, *args):
+            pass
 
     return Handler
 
-
-def main() -> None:
+def main():
     args = build_parser()
     state = create_app_state(args)
     handler = make_handler(state)
-    server = ThreadingHTTPServer((args.host, args.port), handler)
-    print(f"[serve] http://{args.host}:{args.port}")
-    server.serve_forever()
-
+    s = ThreadingHTTPServer((args.host, args.port), handler)
+    print(f"[serve] http://{args.host}:{args.port} ✅")
+    s.serve_forever()
 
 if __name__ == "__main__":
     main()
