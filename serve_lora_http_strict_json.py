@@ -9,6 +9,7 @@ Purpose:
 """
 
 import argparse
+import ast
 import json
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -59,10 +60,20 @@ def _normalize_output(obj: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]
     return out
 
 
+def _parse_maybe_python_dict(text: str) -> Optional[Dict[str, Any]]:
+    try:
+        obj = ast.literal_eval(text)
+    except Exception:
+        return None
+    if isinstance(obj, dict):
+        return obj
+    return None
+
+
 def build_parser() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="LoRA HTTP inference server (strict JSON)")
     parser.add_argument("--host", type=str, default="0.0.0.0")
-    parser.add_argument("--port", type=int, default=8010)
+    parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--base_model", type=str, default="Qwen/Qwen2.5-3B-Instruct")
     parser.add_argument(
         "--adapter_path",
@@ -148,6 +159,8 @@ def make_handler(state: Dict[str, Any]):
                 parsed = json.loads(text)
             except Exception:
                 parsed = _extract_first_json_object(text)
+                if parsed is None:
+                    parsed = _parse_maybe_python_dict(text)
             return {"text": text, "parsed": _normalize_output(parsed)}
 
         def do_GET(self):  # noqa: N802
