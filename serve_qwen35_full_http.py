@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import re
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, Optional
@@ -72,6 +73,67 @@ def _quality_score(obj: Optional[Dict[str, Any]]) -> int:
         if " " in body and len(body.split()) == 2 and all(len(x) > 1 for x in body.split()):
             score -= 4
     return score
+
+
+def _postprocess_relationships(
+    obj: Optional[Dict[str, Any]], content: str
+) -> Optional[Dict[str, Any]]:
+    if not isinstance(obj, dict):
+        return obj
+    rels = obj.get("relationships", [])
+    if not isinstance(rels, list):
+        obj["relationships"] = []
+        return obj
+
+    deny_tokens = ("avenue", "official", "shop", "store", "creator")
+    out = []
+    seen = set()
+    text_l = content.lower()
+
+    for r in rels:
+        if not isinstance(r, dict):
+            continue
+        brand = str(r.get("brand_text", "")).strip()
+        if not brand:
+            continue
+
+        # Normalize "from the house of X" to X.
+        m = re.search(r"from the house of\\s+([a-z0-9_\\-]+)", brand, flags=re.I)
+        if m:
+            brand = m.group(1)
+
+        # Strip @ prefix for brand matching.
+        brand_no_at = brand[1:].strip() if brand.startswith("@") else brand
+        b_l = brand_no_at.lower()
+
+        # Remove likely person-like account names.
+        parts = [p for p in brand_no_at.split() if p]
+        if len(parts) == 2 and all(p.isalpha() for p in parts):
+            continue
+
+        # Remove likely channel/store handles.
+        if any(tok in b_l for tok in deny_tokens):
+            continue
+
+        # Keep only if appears in content.
+        pos = text_l.find(b_l)
+        if pos < 0:
+            continue
+        end = pos + len(brand_no_at)
+        key = (b_l, pos, end)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(
+            {
+                "brand_text": brand_no_at,
+                "start": str(pos),
+                "end": str(end),
+            }
+        )
+
+    obj["relationships"] = out[:3]
+    return obj
 
 
 def build_parser() -> argparse.Namespace:
@@ -189,7 +251,9 @@ def make_handler(state: Dict[str, Any]):
                     parsed_raw = json.loads(text_raw)
                 except Exception:
                     parsed_raw = _extract_first_json_object(text_raw)
-                return text_raw, _normalize_output(parsed_raw)
+                norm = _normalize_output(parsed_raw)
+                norm = _postprocess_relationships(norm, content)
+                return text_raw, norm
 
             text, parsed = _run_once(messages, max_new_tokens)
             score = _quality_score(parsed)
