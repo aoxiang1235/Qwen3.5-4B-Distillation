@@ -26,6 +26,15 @@ def _extract_first_json_object(text: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+def _strip_thinking_text(text: str) -> str:
+    # Remove common chain-of-thought markers before JSON extraction.
+    for marker in ("Thinking Process:", "</think>"):
+        idx = text.find(marker)
+        if idx >= 0:
+            text = text[:idx]
+    return text.strip()
+
+
 def _normalize_output(obj: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     if not isinstance(obj, dict):
         return None
@@ -246,14 +255,15 @@ def make_handler(state: Dict[str, Any]):
                         skip_special_tokens=True,
                     ).strip()
                 )
+                cleaned = _strip_thinking_text(text_raw)
                 parsed_raw = None
                 try:
-                    parsed_raw = json.loads(text_raw)
+                    parsed_raw = json.loads(cleaned)
                 except Exception:
-                    parsed_raw = _extract_first_json_object(text_raw)
+                    parsed_raw = _extract_first_json_object(cleaned)
                 norm = _normalize_output(parsed_raw)
                 norm = _postprocess_relationships(norm, content)
-                return text_raw, norm
+                return cleaned, norm
 
             text, parsed = _run_once(messages, max_new_tokens)
             score = _quality_score(parsed)
@@ -276,6 +286,18 @@ def make_handler(state: Dict[str, Any]):
                     text, parsed = text2, parsed2
 
             elapsed_ms = int((time.perf_counter() - t0) * 1000)
+            if parsed is None:
+                self._resp(
+                    422,
+                    {
+                        "ok": False,
+                        "error": "non_json_model_output",
+                        "elapsed_ms": elapsed_ms,
+                        "output_text": "",
+                        "output_json": None,
+                    },
+                )
+                return
             self._resp(
                 200,
                 {
