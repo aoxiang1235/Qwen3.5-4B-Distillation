@@ -1,0 +1,59 @@
+[load] model_path=training_runs/best_B_full_20260425_184108_merged
+Traceback (most recent call last):
+  File "/Users/yaoyushao/opt/anaconda3/lib/python3.9/site-packages/huggingface_hub/utils/_http.py", line 403, in hf_raise_for_status
+    response.raise_for_status()
+  File "/Users/yaoyushao/opt/anaconda3/lib/python3.9/site-packages/requests/models.py", line 1021, in raise_for_status
+    raise HTTPError(http_error_msg, response=self)
+requests.exceptions.HTTPError: 401 Client Error: Unauthorized for url: https://huggingface.co/training_runs/best_B_full_20260425_184108_merged/resolve/main/tokenizer_config.json
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/Users/yaoyushao/opt/anaconda3/lib/python3.9/site-packages/transformers/utils/hub.py", line 479, in cached_files
+    hf_hub_download(
+  File "/Users/yaoyushao/opt/anaconda3/lib/python3.9/site-packages/huggingface_hub/utils/_validators.py", line 114, in _inner_fn
+    return fn(*args, **kwargs)
+  File "/Users/yaoyushao/opt/anaconda3/lib/python3.9/site-packages/huggingface_hub/file_download.py", line 1014, in hf_hub_download
+    return _hf_hub_download_to_cache_dir(
+  File "/Users/yaoyushao/opt/anaconda3/lib/python3.9/site-packages/huggingface_hub/file_download.py", line 1121, in _hf_hub_download_to_cache_dir
+    _raise_on_head_call_error(head_call_error, force_download, local_files_only)
+  File "/Users/yaoyushao/opt/anaconda3/lib/python3.9/site-packages/huggingface_hub/file_download.py", line 1662, in _raise_on_head_call_error
+    raise head_call_error
+  File "/Users/yaoyushao/opt/anaconda3/lib/python3.9/site-packages/huggingface_hub/file_download.py", line 1550, in _get_metadata_or_catch_error
+    metadata = get_hf_file_metadata(
+  File "/Users/yaoyushao/opt/anaconda3/lib/python3.9/site-packages/huggingface_hub/utils/_validators.py", line 114, in _inner_fn
+    return fn(*args, **kwargs)
+  File "/Users/yaoyushao/opt/anaconda3/lib/python3.9/site-packages/huggingface_hub/file_download.py", line 1467, in get_hf_file_metadata
+    r = _request_wrapper(
+  File "/Users/yaoyushao/opt/anaconda3/lib/python3.9/site-packages/huggingface_hub/file_download.py", line 283, in _request_wrapper
+    response = _request_wrapper(
+  File "/Users/yaoyushao/opt/anaconda3/lib/python3.9/site-packages/huggingface_hub/file_download.py", line 307, in _request_wrapper
+    hf_raise_for_status(response)
+  File "/Users/yaoyushao/opt/anaconda3/lib/python3.9/site-packages/huggingface_hub/utils/_http.py", line 453, in hf_raise_for_status
+    raise _format(RepositoryNotFoundError, message, response) from e
+huggingface_hub.errors.RepositoryNotFoundError: 401 Client Error. (Request ID: Root=1-69ee4e5a-656b3b326a0c4f3146d87810;d049b2c0-1c98-4a31-93bc-85396d51c0c0)
+
+Repository Not Found for url: https://huggingface.co/training_runs/best_B_full_20260425_184108_merged/resolve/main/tokenizer_config.json.
+Please make sure you specified the correct `repo_id` and `repo_type`.
+If you are trying to access a private or gated repo, make sure you are authenticated. For more details, see https://huggingface.co/docs/huggingface_hub/authentication
+Invalid username or password.
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/Users/yaoyushao/Documents/595/BeautyBrain/Qwen3.5-4B-Distillation/serve_qwen35_full_http_8bit.py", line 216, in <module>
+    main()
+  File "/Users/yaoyushao/Documents/595/BeautyBrain/Qwen3.5-4B-Distillation/serve_qwen35_full_http_8bit.py", line 209, in main
+    state = create_state(args)
+  File "/Users/yaoyushao/Documents/595/BeautyBrain/Qwen3.5-4B-Distillation/serve_qwen35_full_http_8bit.py", line 69, in create_state
+    tokenizer = AutoTokenizer.from_pretrained(args.model_path, use_fast=False)
+  File "/Users/yaoyushao/opt/anaconda3/lib/python3.9/site-packages/transformers/models/auto/tokenization_auto.py", line 1089, in from_pretrained
+    tokenizer_config = get_tokenizer_config(pretrained_model_name_or_path, **kwargs)
+  File "/Users/yaoyushao/opt/anaconda3/lib/python3.9/site-packages/transformers/models/auto/tokenization_auto.py", line 921, in get_tokenizer_config
+    resolved_config_file = cached_file(
+  File "/Users/yaoyushao/opt/anaconda3/lib/python3.9/site-packages/transformers/utils/hub.py", line 322, in cached_file
+    file = cached_files(path_or_repo_id=path_or_repo_id, filenames=[filename], **kwargs)
+  File "/Users/yaoyushao/opt/anaconda3/lib/python3.9/site-packages/transformers/utils/hub.py", line 511, in cached_files
+    raise OSError(
+OSError: training_runs/best_B_full_20260425_184108_merged is not a local folder and is not a valid model identifier listed on 'https://huggingface.co/models'
+If this is a private repository, make sure to pass a token having permission to this repo either by logging in with `hf auth login` or by passing `token=<your_token>`
