@@ -29,7 +29,7 @@ fi
 lsof -iTCP:"$PORT" -sTCP:LISTEN -t | xargs -r kill || true
 sleep 1
 
-nohup python3 -u serve_lora_http_strict_json.py \
+nohup python3 -u serve_qwen35_full_http_4bit.py \
   --host 0.0.0.0 \
   --port "$PORT" \
   --base_model "$BASE_MODEL" \
