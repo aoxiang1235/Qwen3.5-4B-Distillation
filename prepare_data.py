@@ -15,30 +15,30 @@ import xml.etree.ElementTree as ET
 XML_NS = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
 
 DEFAULT_INSTRUCTION = (
-    "You are an AI assistant for beauty-industry information extraction from social media text "
-    "(TikTok, Instagram, YouTube, Snapchat), including hashtags and @brand mentions.\n\n"
-    "Your task:\n"
-    "1. Determine whether the content is beauty-related (skincare, makeup, perfume, haircare).\n"
-    '2. If non-beauty, set "is_beauty" to false and return an empty "relationships" list.\n'
-    '3. If beauty-related, set "is_beauty" to true and extract brand mentions into "relationships".\n\n'
-    "Output schema:\n"
-    "{\n"
-    '  "is_beauty": true/false,\n'
-    '  "reasoning": "short reason",\n'
-    '  "relationships": [\n'
-    "    {\n"
-    '      "brand_text": "original matched text",\n'
-    '      "start": "start offset",\n'
-    '      "end": "end offset"\n'
-    "    }\n"
-    "  ]\n"
-    "}\n\n"
+    "You are an information extraction assistant.\n\n"
+    "Task:\n"
+    "1) Determine whether the post is beauty-related.\n"
+    "2) Extract beauty-related brand mentions.\n\n"
+    "Output:\n"
+    "Return ONLY a valid JSON object with this schema:\n"
+    '{"is_beauty": true/false, "reasoning": "short reason", "relationships": [{"brand_text":"..."}]}\n\n'
+    "Example:\n"
+    '{"is_beauty": true, "reasoning": "Perfume discussion with explicit brand mentions.", "relationships": [{"brand_text":"Guerlain"},{"brand_text":"Dior"}]}\n\n'
     "Rules:\n"
-    "- Keep only beauty-related brand mentions.\n"
-    "- For mixed-category brands (e.g., Gucci, Prada), keep only when context is beauty-related.\n"
-    "- Distinguish person names from brand names by context.\n"
-    "- Keep offsets aligned with the original text.\n"
-    "- Return JSON only. No extra explanation outside JSON."
+    "1) Keep only beauty-related BRANDS (cosmetics, skincare, fragrance, haircare).\n"
+    "2) Exclude person names, influencer handles, artist names, and store/salon/spa/shop names.\n"
+    '3) Mentions like "@username" are NOT brands unless the text clearly refers to a beauty brand/product.\n'
+    "4) brand_text must be copied from the original text span (no rewriting).\n"
+    "5) Remove duplicates, keep first-mention order.\n"
+    "6) If uncertain whether a mention is a brand, do NOT extract it.\n"
+    "7) If is_beauty is false, relationships must be [].\n"
+    "8) reasoning should be concise (one short sentence).\n"
+    "9) Do not output any extra text.\n\n"
+    "Negative examples:\n"
+    '- Input: "Thanks Chloe for doing my makeup at Bella Beauty Studio."\n'
+    '- Output: {"is_beauty": true, "reasoning": "Beauty context but only person/store mentions, no clear brand.", "relationships": []}\n'
+    '- Input: "Follow @amy_makeup_artist and visit Glow Salon now."\n'
+    '- Output: {"is_beauty": true, "reasoning": "Contains person/store mentions without clear brand.", "relationships": []}'
 )
 
 
@@ -101,62 +101,43 @@ def build_samples(rows: List[Dict[str, str]], instruction: str) -> Tuple[List[Di
         groups[(post_id, content)].append(row)
 
     samples: List[Dict] = []
-    invalid_offset = 0
-    non_beauty_with_rel = 0
     multi_rel = 0
 
-    for (_, content), items in groups.items():
+    for (post_id, content), items in groups.items():
         is_beauty = any(parse_bool(row.get("is_beauty", "")) for row in items)
-        sample_reasoning = ""
+        reasoning = ""
         relationships = []
         seen = set()
 
         for row in items:
-            row_reasoning = str(row.get("reasoning") or "").strip()
-            if not sample_reasoning and row_reasoning:
-                sample_reasoning = row_reasoning
-
+            if not reasoning:
+                candidate_reasoning = str(row.get("reasoning") or "").strip()
+                if candidate_reasoning:
+                    reasoning = candidate_reasoning
             brand_text = str(row.get("brand_text") or row.get("brand") or "").strip()
-            start = str(row.get("start") or "").strip()
-            end = str(row.get("end") or "").strip()
-            rel_reasoning = row_reasoning
             if not brand_text:
                 continue
 
-            try:
-                s_idx = int(start)
-                e_idx = int(end)
-                if s_idx < 0 or e_idx <= s_idx or e_idx > len(content):
-                    invalid_offset += 1
-            except ValueError:
-                invalid_offset += 1
-
-            key = (brand_text.lower(), start, end)
+            key = brand_text.lower()
             if key in seen:
                 continue
             seen.add(key)
-            relationships.append(
-                {
-                    "brand_text": brand_text,
-                    "start": start,
-                    "end": end
-                }
-            )
-
-        if not is_beauty and relationships:
-            non_beauty_with_rel += 1
-            relationships = []
+            relationships.append({"brand_text": brand_text})
 
         if len(relationships) > 1:
             multi_rel += 1
 
+        if not is_beauty:
+            relationships = []
+
         output = {
             "is_beauty": is_beauty,
-            "reasoning": sample_reasoning,
+            "reasoning": reasoning,
             "relationships": relationships,
         }
         samples.append(
             {
+                "post_id": post_id,
                 "instruction": instruction,
                 "content": content,
                 "output": output,
@@ -166,8 +147,6 @@ def build_samples(rows: List[Dict[str, str]], instruction: str) -> Tuple[List[Di
     stats = {
         "groups": len(groups),
         "samples": len(samples),
-        "invalid_offset": invalid_offset,
-        "non_beauty_with_rel": non_beauty_with_rel,
         "multi_relationship_samples": multi_rel,
     }
     return samples, stats

@@ -76,15 +76,14 @@ def _validate_output_schema(output: object, row_idx: int) -> None:
             raise ValueError(
                 f"第 {row_idx} 条样本 output.relationships[{rel_idx}] 必须是 object。"
             )
-        for k in ("brand_text", "start", "end"):
-            if k not in rel:
-                raise ValueError(
-                    f"第 {row_idx} 条样本 output.relationships[{rel_idx}] 缺少字段 {k}。"
-                )
-            if not isinstance(rel[k], str):
-                raise ValueError(
-                    f"第 {row_idx} 条样本 output.relationships[{rel_idx}].{k} 必须是 string。"
-                )
+        if "brand_text" not in rel:
+            raise ValueError(
+                f"第 {row_idx} 条样本 output.relationships[{rel_idx}] 缺少字段 brand_text。"
+            )
+        if not isinstance(rel["brand_text"], str):
+            raise ValueError(
+                f"第 {row_idx} 条样本 output.relationships[{rel_idx}].brand_text 必须是 string。"
+            )
 
 
 def build_examples_from_json(records: Iterable[Dict]) -> List[DistillExample]:
@@ -358,14 +357,14 @@ def parse_args():
     parser.add_argument(
         "--train_jsonl",
         type=str,
-        default="",
-        help="训练集 JSONL 路径（必填）",
+        default="data/train_v2.jsonl",
+        help="训练集 JSONL 路径（默认 data/train_v2.jsonl）",
     )
     parser.add_argument(
         "--val_jsonl",
         type=str,
-        default="",
-        help="验证集 JSONL 路径（可选，不传则按 val_ratio 从 train 切分）",
+        default="data/val_v2.jsonl",
+        help="验证集 JSONL 路径（默认 data/val_v2.jsonl；传空字符串则按 val_ratio 从 train 切分）",
     )
     parser.add_argument(
         "--model_name",
@@ -473,7 +472,7 @@ def main():
 
     print("[1/5] 读取数据")
     if not args.train_jsonl:
-        raise ValueError("已禁用 Excel 入口，请传 --train_jsonl。")
+        raise ValueError("已禁用 Excel 入口，请传 --train_jsonl（或使用默认 data/train_v2.jsonl）。")
     if not os.path.exists(args.train_jsonl):
         raise FileNotFoundError(f"找不到训练集 JSONL: {args.train_jsonl}")
     train_records = load_jsonl(args.train_jsonl)
