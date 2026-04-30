@@ -39,6 +39,13 @@ class DistillExample:
     output_text: str
 
 
+DEFAULT_SYSTEM_PROMPT = "You are a strict structured information extraction assistant."
+
+
+def _build_user_content(instruction: str, content: str) -> str:
+    return f"Instruction:\n{instruction}\n\nContent:\n{content}"
+
+
 def load_jsonl(path: str) -> List[Dict]:
     records: List[Dict] = []
     with open(path, "r", encoding="utf-8") as f:
@@ -86,14 +93,19 @@ def _validate_output_schema(output: object, row_idx: int) -> None:
             )
 
 
-def build_examples_from_json(records: Iterable[Dict]) -> List[DistillExample]:
+def build_examples_from_json(
+    records: Iterable[Dict], instruction_override: str = ""
+) -> List[DistillExample]:
     examples: List[DistillExample] = []
+    override = instruction_override.strip()
     for row_idx, row in enumerate(records, start=1):
         instruction = str(row.get("instruction") or "").strip()
         content = str(row.get("content") or "").strip()
         output = row.get("output")
         if not instruction or not content or output is None:
             continue
+        if override:
+            instruction = override
         _validate_output_schema(output, row_idx)
         examples.append(
             DistillExample(
@@ -108,10 +120,10 @@ def build_examples_from_json(records: Iterable[Dict]) -> List[DistillExample]:
 def format_chat(example: DistillExample, tokenizer) -> str:
     # Qwen chat 模板，训练目标放在 assistant 回复里。
     messages = [
-        {"role": "system", "content": "你是一个严谨的结构化信息抽取助手。"},
+        {"role": "system", "content": DEFAULT_SYSTEM_PROMPT},
         {
             "role": "user",
-            "content": f"指令：{example.instruction}\n\n文本：{example.input_text}",
+            "content": _build_user_content(example.instruction, example.input_text),
         },
         {"role": "assistant", "content": example.output_text},
     ]
@@ -177,7 +189,7 @@ def split_dataset(
 
 
 def tokenize_fn(tokenizer, max_length: int):
-    system_content = "你是一个严谨的结构化信息抽取助手。"
+    system_content = DEFAULT_SYSTEM_PROMPT
 
     def _tokenize(batch):
         input_ids_list: List[List[int]] = []
@@ -194,7 +206,7 @@ def tokenize_fn(tokenizer, max_length: int):
                 {"role": "system", "content": system_content},
                 {
                     "role": "user",
-                    "content": f"指令：{ex.instruction}\n\n文本：{ex.input_text}",
+                    "content": _build_user_content(ex.instruction, ex.input_text),
                 },
                 {"role": "assistant", "content": ex.output_text},
             ]
@@ -202,7 +214,7 @@ def tokenize_fn(tokenizer, max_length: int):
                 {"role": "system", "content": system_content},
                 {
                     "role": "user",
-                    "content": f"指令：{ex.instruction}\n\n文本：{ex.input_text}",
+                    "content": _build_user_content(ex.instruction, ex.input_text),
                 },
             ]
             full_text = tokenizer.apply_chat_template(
@@ -435,6 +447,12 @@ def parse_args():
         action="store_true",
         help="关闭梯度检查点（默认开启以降低显存；关闭可略快但易 OOM）",
     )
+    parser.add_argument(
+        "--instruction_override",
+        type=str,
+        default="",
+        help="若非空，则覆盖 JSONL 中每条样本的 instruction（用于快速替换提示词）",
+    )
     return parser.parse_args()
 
 
@@ -477,14 +495,18 @@ def main():
         raise FileNotFoundError(f"找不到训练集 JSONL: {args.train_jsonl}")
     train_records = load_jsonl(args.train_jsonl)
     print(f"  - train records: {len(train_records)}")
-    train_examples = build_examples_from_json(train_records)
+    train_examples = build_examples_from_json(
+        train_records, instruction_override=args.instruction_override
+    )
 
     if args.val_jsonl:
         if not os.path.exists(args.val_jsonl):
             raise FileNotFoundError(f"找不到验证集 JSONL: {args.val_jsonl}")
         val_records = load_jsonl(args.val_jsonl)
         print(f"  - val records: {len(val_records)}")
-        val_examples = build_examples_from_json(val_records)
+        val_examples = build_examples_from_json(
+            val_records, instruction_override=args.instruction_override
+        )
         dataset = DatasetDict(
             {
                 "train": Dataset.from_list([e.__dict__ for e in train_examples]),
