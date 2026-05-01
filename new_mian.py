@@ -331,7 +331,9 @@ def _aligned_logging_steps(requested: int, grad_accum: int) -> int:
     return max(ga, aligned)
 
 
-def _filter_weak_supervision(ds, min_tokens: int, split_name: str):
+def _filter_weak_supervision(
+    ds, min_tokens: int, split_name: str, min_samples_after_filter: int
+):
     """去掉 labels 全为 -100 或有效 token 过少的样本。"""
 
     def _ok(example: Dict[str, List[int]]) -> bool:
@@ -341,9 +343,10 @@ def _filter_weak_supervision(ds, min_tokens: int, split_name: str):
     out = ds.filter(_ok)
     n_after = len(out)
     print(f"  - {split_name}: 过滤弱监督样本 {n_before} -> {n_after} (min_supervised_tokens={min_tokens})")
-    if n_after < 10:
+    if n_after < min_samples_after_filter:
         raise RuntimeError(
-            f"{split_name} 过滤后样本不足 10 条，请降低 --min_supervised_tokens 或检查截断/模板。"
+            f"{split_name} 过滤后样本不足 {min_samples_after_filter} 条，请降低 "
+            "--min_supervised_tokens / --min_split_samples_after_filter，或检查截断/模板。"
         )
     return out
 
@@ -441,6 +444,12 @@ def parse_args():
         type=float,
         default=1.0,
         help="梯度裁剪阈值；默认 1.0 以提升数值稳定性",
+    )
+    parser.add_argument(
+        "--min_split_samples_after_filter",
+        type=int,
+        default=10,
+        help="每个数据集 split 在弱监督过滤后至少保留的样本数；小样本调试时可设为 1~2",
     )
     parser.add_argument(
         "--no_gradient_checkpointing",
@@ -551,10 +560,16 @@ def main():
         remove_columns=dataset["train"].column_names,
     )
     tokenized["train"] = _filter_weak_supervision(
-        tokenized["train"], args.min_supervised_tokens, "train"
+        tokenized["train"],
+        args.min_supervised_tokens,
+        "train",
+        args.min_split_samples_after_filter,
     )
     tokenized["validation"] = _filter_weak_supervision(
-        tokenized["validation"], args.min_supervised_tokens, "validation"
+        tokenized["validation"],
+        args.min_supervised_tokens,
+        "validation",
+        args.min_split_samples_after_filter,
     )
     _print_supervision_stats(tokenized["train"], "train")
     _print_supervision_stats(tokenized["validation"], "validation")
