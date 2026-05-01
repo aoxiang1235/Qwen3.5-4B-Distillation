@@ -12,14 +12,12 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 def _extract_first_json_object(text: str) -> Optional[Dict[str, Any]]:
     idx = text.find("{")
-    if idx < 0:
-        return None
+    if idx < 0: return None
     decoder = json.JSONDecoder()
     while idx >= 0 and idx < len(text):
         try:
             obj, _ = decoder.raw_decode(text[idx:])
-            if isinstance(obj, dict):
-                return obj
+            if isinstance(obj, dict): return obj
         except Exception:
             pass
         idx = text.find("{", idx + 1)
@@ -27,17 +25,14 @@ def _extract_first_json_object(text: str) -> Optional[Dict[str, Any]]:
 
 
 def _strip_thinking_text(text: str) -> str:
-    # Remove common chain-of-thought markers before JSON extraction.
     for marker in ("Thinking Process:", "</think>"):
         idx = text.find(marker)
-        if idx >= 0:
-            text = text[:idx]
+        if idx >= 0: text = text[:idx]
     return text.strip()
 
 
 def _normalize_output(obj: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    if not isinstance(obj, dict):
-        return None
+    if not isinstance(obj, dict): return None
     out: Dict[str, Any] = {
         "is_beauty": bool(obj.get("is_beauty", False)),
         "reasoning": str(obj.get("reasoning", "")),
@@ -46,324 +41,120 @@ def _normalize_output(obj: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]
     rels = obj.get("relationships", [])
     if isinstance(rels, list):
         for r in rels:
-            if not isinstance(r, dict):
-                continue
+            if not isinstance(r, dict): continue
             brand = str(r.get("brand_text", "")).strip()
-            start = str(r.get("start", "")).strip()
-            end = str(r.get("end", "")).strip()
-            if not brand:
-                continue
-            out["relationships"].append(
-                {"brand_text": brand, "start": start, "end": end}
-            )
+            if not brand: continue
+            out["relationships"].append({"brand_text": brand, "start": "", "end": ""})
     return out
 
 
-def _quality_score(obj: Optional[Dict[str, Any]]) -> int:
-    if not isinstance(obj, dict):
-        return -100
-    rels = obj.get("relationships", [])
-    if not isinstance(rels, list):
-        return -50
-    score = 10
-    for r in rels:
-        if not isinstance(r, dict):
-            score -= 2
-            continue
-        brand = str(r.get("brand_text", "")).strip()
-        if not brand:
-            score -= 2
-            continue
-        score += 2
-        if brand.startswith("@"):
-            score -= 2
-        # Heuristic: likely person-like @name surname
-        body = brand[1:] if brand.startswith("@") else brand
-        if " " in body and len(body.split()) == 2 and all(len(x) > 1 for x in body.split()):
-            score -= 4
-    return score
-
-
-def _postprocess_relationships(
-    obj: Optional[Dict[str, Any]], content: str
-) -> Optional[Dict[str, Any]]:
-    if not isinstance(obj, dict):
-        return obj
+def _postprocess_relationships(obj: Optional[Dict[str, Any]], content: str) -> Optional[Dict[str, Any]]:
+    if not isinstance(obj, dict): return obj
     rels = obj.get("relationships", [])
     if not isinstance(rels, list):
         obj["relationships"] = []
         return obj
 
-    deny_tokens = ("avenue", "official", "shop", "store", "creator")
+    deny_tokens = ("official", "shop", "store", "creator", "avenue")
     out = []
     seen = set()
     text_l = content.lower()
 
     for r in rels:
-        if not isinstance(r, dict):
-            continue
         brand = str(r.get("brand_text", "")).strip()
-        if not brand:
-            continue
+        if not brand: continue
 
-        # Normalize "from the house of X" to X.
-        m = re.search(r"from the house of\\s+([a-z0-9_\\-]+)", brand, flags=re.I)
-        if m:
-            brand = m.group(1)
+        # 预处理：去掉 @ 符号
+        brand_clean = brand[1:].strip() if brand.startswith("@") else brand
+        b_l = brand_clean.lower()
 
-        # Strip @ prefix for brand matching.
-        brand_no_at = brand[1:].strip() if brand.startswith("@") else brand
-        b_l = brand_no_at.lower()
+        # 过滤掉明显的店铺/官方账号关键词
+        if any(tok in b_l for tok in deny_tokens): continue
 
-        # Remove likely person-like account names.
-        parts = [p for p in brand_no_at.split() if p]
-        if len(parts) == 2 and all(p.isalpha() for p in parts):
-            continue
-
-        # Remove likely channel/store handles.
-        if any(tok in b_l for tok in deny_tokens):
-            continue
-
-        # Keep only if appears in content.
+        # 检查是否在原文中出现
         pos = text_l.find(b_l)
-        if pos < 0:
-            continue
-        end = pos + len(brand_no_at)
-        key = (b_l, pos, end)
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(
-            {
-                "brand_text": brand_no_at,
-                "start": str(pos),
-                "end": str(end),
-            }
-        )
+        if pos >= 0:
+            end = pos + len(brand_clean)
+            key = (b_l, pos)
+            if key not in seen:
+                seen.add(key)
+                out.append({
+                    "brand_text": brand_clean,
+                    "start": str(pos),
+                    "end": str(end),
+                })
 
-    obj["relationships"] = out[:3]
+    # 【关键修改】：不再截断为 [:3]，保留所有识别结果
+    obj["relationships"] = out
     return obj
 
 
-def build_parser() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Qwen3.5-4B full-model HTTP server")
-    p.add_argument("--host", type=str, default="0.0.0.0")
-    p.add_argument("--port", type=int, default=8000)
-    p.add_argument(
-        "--model_path",
-        type=str,
-        default="training_runs/best_B_full_20260425_184108_merged",
-    )
-    p.add_argument("--max_new_tokens", type=int, default=256)
-    return p.parse_args()
-
-
-def create_state(args: argparse.Namespace) -> Dict[str, Any]:
-    print(f"[load] model_path={args.model_path}")
-    tokenizer = AutoTokenizer.from_pretrained(args.model_path, use_fast=False)
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_path,
-        torch_dtype=torch.float16,
-        device_map="auto",
-    )
-    model.eval()
-    print("[load] model ready")
-    return {"tokenizer": tokenizer, "model": model, "args": args}
-
-
-def make_handler(state: Dict[str, Any]):
-    tokenizer = state["tokenizer"]
-    model = state["model"]
-    args = state["args"]
+def make_handler(state):
+    tokenizer, model, args = state["tokenizer"], state["model"], state["args"]
 
     class Handler(BaseHTTPRequestHandler):
-        def _resp(self, status: int, payload: Dict[str, Any]) -> None:
+        def _resp(self, status, payload):
             body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
             self.send_response(status)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
 
-        def do_GET(self):  # noqa: N802
-            if self.path == "/health":
-                self._resp(200, {"ok": True})
-                return
-            self._resp(404, {"error": "not_found"})
-
-        def do_POST(self):  # noqa: N802
-            if self.path != "/generate":
-                self._resp(404, {"error": "not_found"})
-                return
-
+        def do_POST(self):
+            if self.path != "/generate": return
             t0 = time.perf_counter()
             try:
                 length = int(self.headers.get("Content-Length", "0"))
-                raw = self.rfile.read(length)
-                payload = json.loads(raw.decode("utf-8"))
-            except Exception as exc:
-                self._resp(400, {"error": f"invalid_json: {exc}"})
-                return
+                payload = json.loads(self.rfile.read(length).decode("utf-8"))
+                instruction = str(payload.get("instruction", "")).strip()
+                content = str(payload.get("content", "")).strip()
+                max_tokens = int(payload.get("max_new_tokens", args.max_new_tokens))
 
-            instruction = str(payload.get("instruction", "")).strip()
-            content = str(payload.get("content", "")).strip()
-            if not instruction or not content:
-                self._resp(400, {"error": "instruction and content are required"})
-                return
+                # --- 核心逻辑：单次请求，让模型自己生成 ---
+                system_prompt = "你是一个品牌提取助手。输出格式：{\"is_beauty\": true, \"reasoning\": \"...\", \"relationships\": [{\"brand_text\": \"...\"}]}"
+                user_content = f"指令：{instruction}\n\n文本：{content}"
 
-            max_new_tokens = int(payload.get("max_new_tokens", args.max_new_tokens))
-            base_system = (
-                "你是一个严谨的结构化信息抽取助手。"
-                "禁止输出思考过程、解释或额外文本；严格遵守输出格式。"
-            )
+                messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_content}]
+                prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 
-            def _run_json_once(msgs, tokens, prefix='{"is_beauty": '):
-                prompt = tokenizer.apply_chat_template(
-                    msgs,
-                    tokenize=False,
-                    add_generation_prompt=True,
-                )
-                prompt = prompt + prefix
                 inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
                 with torch.no_grad():
-                    out = model.generate(
-                        **inputs,
-                        max_new_tokens=tokens,
-                        do_sample=False,
-                    )
-                text_raw = (
-                    prefix
-                    + tokenizer.decode(
-                        out[0][inputs["input_ids"].shape[1] :],
-                        skip_special_tokens=True,
-                    ).strip()
-                )
-                cleaned = _strip_thinking_text(text_raw)
-                parsed_raw = None
-                try:
-                    parsed_raw = json.loads(cleaned)
-                except Exception:
-                    parsed_raw = _extract_first_json_object(cleaned)
-                norm = _normalize_output(parsed_raw)
-                norm = _postprocess_relationships(norm, content)
-                return cleaned, norm
+                    gen = model.generate(**inputs, max_new_tokens=max_tokens, do_sample=False)
 
-            # Stage A: 先抽取结构字段（is_beauty + relationships）
-            stage_a_user = (
-                f"指令：{instruction}\n\n文本：{content}\n\n"
-                "先只做结构抽取：\n"
-                "1) 判断 is_beauty true/false\n"
-                "2) 提取 relationships（仅保留 brand_text）\n\n"
-                "规则：\n"
-                "- 严格排除 Retailers、@社交账号、#hashtag\n"
-                "- 只返回一个 JSON 对象，不要解释文本\n"
-                '- JSON schema: {"is_beauty": true/false, "relationships": [{"brand_text": "..."}]}'
-            )
-            stage_a_messages = [
-                {"role": "system", "content": base_system},
-                {"role": "user", "content": stage_a_user},
-            ]
-            _, stage_a = _run_json_once(stage_a_messages, max_new_tokens)
-            score = _quality_score(stage_a)
+                output_text = tokenizer.decode(gen[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
 
-            if score < 8:
-                stage_a_retry_messages = [
-                    {"role": "system", "content": base_system},
-                    {
-                        "role": "user",
-                        "content": (
-                            stage_a_user
-                            + "\n\n纠偏规则：忽略人名账号和店铺/渠道账号；"
-                            "优先抽取品牌主体（例如 'from the house of armaf' 应抽取 armaf）。"
-                        ),
-                    },
-                ]
-                _, stage_a_retry = _run_json_once(
-                    stage_a_retry_messages, max(max_new_tokens, 512)
-                )
-                if _quality_score(stage_a_retry) >= score:
-                    stage_a = stage_a_retry
+                # 解析并后处理
+                parsed = _extract_first_json_object(output_text)
+                norm = _normalize_output(parsed)
+                final_json = _postprocess_relationships(norm, content)
 
-            # Stage B: 再补一条简短 reasoning（不列品牌）
-            if stage_a is None:
-                parsed = None
-                final_text = ""
-            else:
-                stage_b_tokens = max(16, min(64, max_new_tokens // 4))
-                stage_b_user = (
-                    f"指令：{instruction}\n\n"
-                    f"文本：{content}\n\n"
-                    f"抽取结果：{json.dumps({'is_beauty': stage_a.get('is_beauty', False), 'relationships': stage_a.get('relationships', [])}, ensure_ascii=False)}\n\n"
-                    "请只输出一句简短 reasoning（纯文本，不要 JSON，不要列品牌名）。"
-                )
-                stage_b_messages = [
-                    {"role": "system", "content": base_system},
-                    {"role": "user", "content": stage_b_user},
-                ]
-                prompt_b = tokenizer.apply_chat_template(
-                    stage_b_messages, tokenize=False, add_generation_prompt=True
-                )
-                inputs_b = tokenizer(prompt_b, return_tensors="pt").to(model.device)
-                with torch.no_grad():
-                    out_b = model.generate(
-                        **inputs_b,
-                        max_new_tokens=stage_b_tokens,
-                        do_sample=False,
-                    )
-                reasoning = tokenizer.decode(
-                    out_b[0][inputs_b["input_ids"].shape[1] :],
-                    skip_special_tokens=True,
-                ).strip()
-                reasoning = _strip_thinking_text(reasoning).splitlines()[0].strip()
-                reasoning = reasoning.strip().strip('"').strip()
-                if not reasoning:
-                    reasoning = (
-                        "Beauty-related content with explicit brand mentions."
-                        if stage_a.get("is_beauty", False)
-                        else "Content is not beauty-related."
-                    )
-
-                parsed = {
-                    "is_beauty": bool(stage_a.get("is_beauty", False)),
-                    "relationships": stage_a.get("relationships", []),
-                    "reasoning": reasoning,
-                }
-                final_text = json.dumps(parsed, ensure_ascii=False)
-
-            elapsed_ms = int((time.perf_counter() - t0) * 1000)
-            if parsed is None:
-                self._resp(
-                    422,
-                    {
-                        "ok": False,
-                        "error": "non_json_model_output",
-                        "elapsed_ms": elapsed_ms,
-                        "output_text": final_text,
-                        "output_json": None,
-                    },
-                )
-                return
-            self._resp(
-                200,
-                {
+                elapsed_ms = int((time.perf_counter() - t0) * 1000)
+                self._resp(200, {
                     "ok": True,
                     "elapsed_ms": elapsed_ms,
-                    "output_text": final_text,
-                    "output_json": parsed,
-                },
-            )
-
-        def log_message(self, format: str, *args_) -> None:
-            return
+                    "output_json": final_json
+                })
+            except Exception as e:
+                self._resp(500, {"error": str(e)})
 
     return Handler
 
 
-def main() -> None:
-    args = build_parser()
-    st = create_state(args)
-    server = ThreadingHTTPServer((args.host, args.port), make_handler(st))
-    print(f"[serve] http://{args.host}:{args.port}")
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model_path", type=str, required=True)
+    parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--max_new_tokens", type=int, default=512)
+    args = parser.parse_args()
+
+    print(f"Loading model: {args.model_path}")
+    tokenizer = AutoTokenizer.from_pretrained(args.model_path)
+    model = AutoModelForCausalLM.from_pretrained(args.model_path, torch_dtype=torch.float16, device_map="auto")
+
+    server = ThreadingHTTPServer(("0.0.0.0", args.port),
+                                 make_handler({"tokenizer": tokenizer, "model": model, "args": args}))
+    print(f"Server started at port {args.port}")
     server.serve_forever()
 
 
