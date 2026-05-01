@@ -214,27 +214,10 @@ def make_handler(state: Dict[str, Any]):
             max_new_tokens = int(payload.get("max_new_tokens", args.max_new_tokens))
             base_system = (
                 "你是一个严谨的结构化信息抽取助手。"
-                "禁止输出思考过程、解释或额外文本；只输出一个合法 JSON 对象。"
+                "禁止输出思考过程、解释或额外文本；严格遵守输出格式。"
             )
-            base_user = (
-                f"指令：{instruction}\n\n文本：{content}\n\n"
-                "只返回一个 JSON 对象，且必须以 { 开头、以 } 结尾，不得输出任何额外文本。\n"
-                'JSON schema: {"is_beauty": true/false, "reasoning": "short reason", '
-                '"relationships": [{"brand_text": "...", "start": "...", "end": "..."}]}'
-            )
-            messages = [
-                {
-                    "role": "system",
-                    "content": base_system,
-                },
-                {
-                    "role": "user",
-                    "content": base_user,
-                },
-            ]
-            prefix = '{"is_beauty": '
 
-            def _run_once(msgs, tokens):
+            def _run_json_once(msgs, tokens, prefix='{"is_beauty": '):
                 prompt = tokenizer.apply_chat_template(
                     msgs,
                     tokenize=False,
@@ -265,25 +248,87 @@ def make_handler(state: Dict[str, Any]):
                 norm = _postprocess_relationships(norm, content)
                 return cleaned, norm
 
-            text, parsed = _run_once(messages, max_new_tokens)
-            score = _quality_score(parsed)
+            # Stage A: 先抽取结构字段（is_beauty + relationships）
+            stage_a_user = (
+                f"指令：{instruction}\n\n文本：{content}\n\n"
+                "先只做结构抽取：\n"
+                "1) 判断 is_beauty true/false\n"
+                "2) 提取 relationships（仅保留 brand_text）\n\n"
+                "规则：\n"
+                "- 严格排除 Retailers、@社交账号、#hashtag\n"
+                "- 只返回一个 JSON 对象，不要解释文本\n"
+                '- JSON schema: {"is_beauty": true/false, "relationships": [{"brand_text": "..."}]}'
+            )
+            stage_a_messages = [
+                {"role": "system", "content": base_system},
+                {"role": "user", "content": stage_a_user},
+            ]
+            _, stage_a = _run_json_once(stage_a_messages, max_new_tokens)
+            score = _quality_score(stage_a)
 
-            # Retry with anti-noise instruction when likely mis-extracting @accounts.
             if score < 8:
-                retry_messages = [
+                stage_a_retry_messages = [
                     {"role": "system", "content": base_system},
                     {
                         "role": "user",
                         "content": (
-                            base_user
+                            stage_a_user
                             + "\n\n纠偏规则：忽略人名账号和店铺/渠道账号；"
                             "优先抽取品牌主体（例如 'from the house of armaf' 应抽取 armaf）。"
                         ),
                     },
                 ]
-                text2, parsed2 = _run_once(retry_messages, max(max_new_tokens, 1024))
-                if _quality_score(parsed2) >= score:
-                    text, parsed = text2, parsed2
+                _, stage_a_retry = _run_json_once(
+                    stage_a_retry_messages, max(max_new_tokens, 512)
+                )
+                if _quality_score(stage_a_retry) >= score:
+                    stage_a = stage_a_retry
+
+            # Stage B: 再补一条简短 reasoning（不列品牌）
+            if stage_a is None:
+                parsed = None
+                final_text = ""
+            else:
+                stage_b_tokens = max(16, min(64, max_new_tokens // 4))
+                stage_b_user = (
+                    f"指令：{instruction}\n\n"
+                    f"文本：{content}\n\n"
+                    f"抽取结果：{json.dumps({'is_beauty': stage_a.get('is_beauty', False), 'relationships': stage_a.get('relationships', [])}, ensure_ascii=False)}\n\n"
+                    "请只输出一句简短 reasoning（纯文本，不要 JSON，不要列品牌名）。"
+                )
+                stage_b_messages = [
+                    {"role": "system", "content": base_system},
+                    {"role": "user", "content": stage_b_user},
+                ]
+                prompt_b = tokenizer.apply_chat_template(
+                    stage_b_messages, tokenize=False, add_generation_prompt=True
+                )
+                inputs_b = tokenizer(prompt_b, return_tensors="pt").to(model.device)
+                with torch.no_grad():
+                    out_b = model.generate(
+                        **inputs_b,
+                        max_new_tokens=stage_b_tokens,
+                        do_sample=False,
+                    )
+                reasoning = tokenizer.decode(
+                    out_b[0][inputs_b["input_ids"].shape[1] :],
+                    skip_special_tokens=True,
+                ).strip()
+                reasoning = _strip_thinking_text(reasoning).splitlines()[0].strip()
+                reasoning = reasoning.strip().strip('"').strip()
+                if not reasoning:
+                    reasoning = (
+                        "Beauty-related content with explicit brand mentions."
+                        if stage_a.get("is_beauty", False)
+                        else "Content is not beauty-related."
+                    )
+
+                parsed = {
+                    "is_beauty": bool(stage_a.get("is_beauty", False)),
+                    "relationships": stage_a.get("relationships", []),
+                    "reasoning": reasoning,
+                }
+                final_text = json.dumps(parsed, ensure_ascii=False)
 
             elapsed_ms = int((time.perf_counter() - t0) * 1000)
             if parsed is None:
@@ -293,7 +338,7 @@ def make_handler(state: Dict[str, Any]):
                         "ok": False,
                         "error": "non_json_model_output",
                         "elapsed_ms": elapsed_ms,
-                        "output_text": "",
+                        "output_text": final_text,
                         "output_json": None,
                     },
                 )
@@ -303,7 +348,7 @@ def make_handler(state: Dict[str, Any]):
                 {
                     "ok": True,
                     "elapsed_ms": elapsed_ms,
-                    "output_text": text,
+                    "output_text": final_text,
                     "output_json": parsed,
                 },
             )
