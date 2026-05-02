@@ -119,11 +119,14 @@ def make_handler(state):
                 content = str(payload.get("content", "")).strip()
                 max_tokens = int(payload.get("max_new_tokens", args.max_new_tokens))
 
-                # --- 核心逻辑：单次请求，让模型自己生成 ---
-                system_prompt = "你是一个品牌提取助手。输出格式：{\"is_beauty\": true, \"reasoning\": \"...\", \"relationships\": [{\"brand_text\": \"...\"}]}"
-                user_content = f"指令：{instruction}\n\n文本：{content}"
-
-                messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_content}]
+                # 与 new_mian.py 训练时 chat 模板一致：system 固定，用户消息里放请求体中的 instruction + content
+                messages = [
+                    {"role": "system", "content": "你是一个严谨的结构化信息抽取助手。"},
+                    {
+                        "role": "user",
+                        "content": f"指令：{instruction}\n\n文本：{content}",
+                    },
+                ]
                 prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 
                 inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
@@ -132,10 +135,12 @@ def make_handler(state):
 
                 output_text = tokenizer.decode(gen[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
 
-                # 解析并后处理
-                parsed = _extract_first_json_object(output_text)
+                parsed = _extract_first_json_object(_strip_thinking_text(output_text))
                 norm = _normalize_output(parsed)
-                final_json = _postprocess_relationships(norm, content)
+                if args.postprocess_relationships:
+                    final_json = _postprocess_relationships(norm, content)
+                else:
+                    final_json = norm
 
                 elapsed_ms = int((time.perf_counter() - t0) * 1000)
                 self._resp(200, {
@@ -154,6 +159,11 @@ def main():
     parser.add_argument("--model_path", type=str, required=True)
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--max_new_tokens", type=int, default=512)
+    parser.add_argument(
+        "--postprocess_relationships",
+        action="store_true",
+        help="按原文匹配并补 start/end、过滤部分词（默认关闭，与训练标签一致）",
+    )
     args = parser.parse_args()
 
     print(f"Loading model: {args.model_path}")
