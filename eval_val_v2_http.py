@@ -2,8 +2,14 @@
 """
 遍历 data/val_v2.jsonl，对每条调用 HTTP /generate，将模型返回与金标一并写入 JSONL。
 
-默认针对本仓库 serve_qwen35_full_http.py（或兼容同接口）的返回字段，例如：
-ok, elapsed_ms, output_json, max_new_tokens_used, note 等。
+每行除 gold_output（来自 val 金标）外，另有：
+- model_output：仅来自服务端解析结果（如 output_json），与金标无关；
+- model_reasoning：从 model_output.reasoning 抽出，便于直接对比；
+- model_response：完整 HTTP JSON（含 ok、elapsed_ms、错误信息等）。
+
+默认针对 serve_qwen35_full_http.py 的 output_json；若接 vanilla 仅有 text，则 model_output 为 {"text": "..."}，model_reasoning 为 null。
+
+启动前默认会 GET /health；连不上则直接退出、不会清空输出文件。
 
 用法示例：
   python3 eval_val_v2_http.py --port 8012 --output data/val_v2_eval_8012.jsonl
@@ -31,6 +37,34 @@ def iter_jsonl(path: Path) -> Iterator[Dict[str, Any]]:
                 yield json.loads(line)
             except json.JSONDecodeError as exc:
                 raise ValueError(f"{path}:{line_no}: invalid JSON: {exc}") from exc
+
+
+def check_health(base_url: str, timeout_sec: float = 5.0) -> tuple[bool, str]:
+    """请求 GET /health；失败时返回 (False, 可读错误说明)。"""
+    url = base_url.rstrip("/") + "/health"
+    req = urllib.request.Request(url, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
+            _ = resp.read()
+        return True, ""
+    except Exception as exc:
+        return False, f"{type(exc).__name__}: {exc}"
+
+
+def extract_model_output(resp: Dict[str, Any]) -> Any:
+    """
+    从大模型 HTTP 返回里取出「模型侧」结构化结果，不写金标。
+    - serve_qwen35_full_http：使用 output_json（dict 或 null）。
+    - serve_qwen35_vanilla_http：无 output_json 时退回 {"text": ...}。
+    """
+    if not isinstance(resp, dict) or resp.get("ok") is not True:
+        return None
+    oj = resp.get("output_json")
+    if isinstance(oj, dict):
+        return oj
+    if oj is None and isinstance(resp.get("text"), str):
+        return {"text": resp["text"]}
+    return None
 
 
 def post_generate(
@@ -82,7 +116,7 @@ def main() -> None:
         "--output",
         type=str,
         default="data/val_v2_eval_8012.jsonl",
-        help="输出 JSONL（每行一条评测记录）",
+        help="输出 JSONL（每行一条评测记录；含 model_output：仅来自接口解析结果，与 gold_output 分离）",
     )
     parser.add_argument(
         "--base-url",
@@ -113,6 +147,11 @@ def main() -> None:
         default=None,
         help="若服务端支持，透传 append_json_hint（默认不传，由服务端默认）",
     )
+    parser.add_argument(
+        "--skip-health-check",
+        action="store_true",
+        help="跳过启动前 GET /health（不推荐；无服务时会写满 Connection refused）",
+    )
     args = parser.parse_args()
 
     data_path = Path(args.data)
@@ -123,6 +162,17 @@ def main() -> None:
     base = (args.base_url or "").strip() or f"http://{args.host}:{args.port}"
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if not args.skip_health_check:
+        ok_h, err_h = check_health(base, timeout_sec=min(10.0, args.timeout))
+        if not ok_h:
+            print(
+                f"error: 无法连接推理服务 {base}（GET /health 失败: {err_h}）。\n"
+                "请先在本机启动 serve_qwen35_full_http.py（或 SSH 转发后再跑），\n"
+                "或传正确 --base-url；确需无服务跑批请加 --skip-health-check。",
+                file=sys.stderr,
+            )
+            sys.exit(1)
 
     extra: Dict[str, Any] = {}
     if args.append_json_hint is not None:
@@ -159,9 +209,16 @@ def main() -> None:
                 args.timeout,
                 extra if extra else None,
             )
+            model_out = extract_model_output(resp)
+            model_reasoning: Any = None
+            if isinstance(model_out, dict):
+                model_reasoning = model_out.get("reasoning")
+
             rec = {
                 "post_id": post_id,
                 "gold_output": gold,
+                "model_output": model_out,
+                "model_reasoning": model_reasoning,
                 "model_response": resp,
             }
             out_f.write(json.dumps(rec, ensure_ascii=False) + "\n")

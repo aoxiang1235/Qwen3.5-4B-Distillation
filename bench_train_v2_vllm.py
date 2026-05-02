@@ -1,0 +1,214 @@
+#!/usr/bin/env python3
+"""
+逐步遍历 data/train_v2.jsonl，按 vLLM /v1/chat/completions 格式请求（与 val 拼法一致），
+将耗时、post_id、模型返回的 JSON（assistant.content 解析结果）、样本 content 的 JSON 字符串写入日志。
+
+默认日志每行格式（TAB 分隔，便于 cut/awk；字段内无 TAB）：
+  time_sec<TAB>post_id<TAB>output_json<TAB>content_json
+
+output_json：对 assistant.content 做 json.loads 后的对象再 json.dumps（失败则为 {"parse_error": "..."}）。
+content_json：对数据里的 content 字段 json.dumps，保证一行内为合法 JSON 字符串。
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+from typing import Any, Dict, Iterator, Optional, Tuple
+
+
+def iter_jsonl(path: Path) -> Iterator[Dict[str, Any]]:
+    with path.open("r", encoding="utf-8") as f:
+        for line_no, line in enumerate(f, 1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                yield json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"{path}:{line_no}: invalid JSON: {exc}") from exc
+
+
+def post_chat(
+    url: str,
+    model: str,
+    user_content: str,
+    max_tokens: int,
+    temperature: float,
+    timeout_sec: float,
+) -> Tuple[float, Dict[str, Any]]:
+    """返回 (elapsed_seconds, response_json_dict)。HTTP 非 2xx 或非法 JSON 时 dict 内含 ok: false。"""
+    body: Dict[str, Any] = {
+        "model": model,
+        "messages": [{"role": "user", "content": user_content}],
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    }
+    raw_b = json.dumps(body, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=raw_b,
+        headers={"Content-Type": "application/json; charset=utf-8"},
+        method="POST",
+    )
+    t0 = time.perf_counter()
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
+            text = resp.read().decode("utf-8")
+    except Exception as exc:
+        elapsed = time.perf_counter() - t0
+        return elapsed, {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    elapsed = time.perf_counter() - t0
+    try:
+        return elapsed, json.loads(text)
+    except json.JSONDecodeError:
+        return elapsed, {"ok": False, "error": "invalid_json_response", "raw": text[:4000]}
+
+
+def extract_assistant_content(resp: Dict[str, Any]) -> str:
+    choices = resp.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return ""
+    msg = choices[0].get("message") if isinstance(choices[0], dict) else None
+    if not isinstance(msg, dict):
+        return ""
+    c = msg.get("content")
+    return c if isinstance(c, str) else ""
+
+
+def parse_model_output_json(text: str) -> Any:
+    if not text.strip():
+        return {"parse_error": "empty_content"}
+    t = text.strip()
+    if t.startswith("```"):
+        lines = t.split("\n")
+        if len(lines) >= 2 and lines[0].startswith("```"):
+            t = "\n".join(lines[1:])
+        if t.rstrip().endswith("```"):
+            t = t.rstrip()[:-3].rstrip()
+    try:
+        return json.loads(t)
+    except json.JSONDecodeError as exc:
+        return {"parse_error": str(exc), "raw": text[:2000]}
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(description="train_v2.jsonl -> vLLM chat bench + log")
+    p.add_argument("--data", type=str, default="data/train_v2.jsonl")
+    p.add_argument(
+        "--url",
+        type=str,
+        default="http://127.0.0.1:8000/v1/chat/completions",
+        help="vLLM OpenAI 兼容 chat 接口完整 URL",
+    )
+    p.add_argument("--model", type=str, default="qwen-3.5-4b")
+    p.add_argument("--max-tokens", type=int, default=512)
+    p.add_argument("--temperature", type=float, default=0.0)
+    p.add_argument("--timeout", type=float, default=600.0)
+    p.add_argument("--log", type=str, default="train_v2_vllm_bench.log")
+    p.add_argument("--limit", type=int, default=0, help="只跑前 N 条，0 表示全部")
+    p.add_argument("--sleep", type=float, default=0.0, help="每条间隔秒数")
+    p.add_argument(
+        "--skip-health",
+        action="store_true",
+        help="跳过启动前对 base URL 的 GET /health（仅去掉 /v1/chat/completions 后缀测端口）",
+    )
+    args = p.parse_args()
+
+    data_path = Path(args.data)
+    if not data_path.is_file():
+        print(f"error: 找不到 {data_path}", file=sys.stderr)
+        sys.exit(1)
+
+    log_path = Path(args.log)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    base = args.url
+    if not args.skip_health:
+        if base.endswith("/v1/chat/completions"):
+            health_url = base[: -len("/v1/chat/completions")] + "/health"
+        else:
+            health_url = base.rstrip("/") + "/health"
+        try:
+            req = urllib.request.Request(health_url, method="GET")
+            with urllib.request.urlopen(req, timeout=10.0) as r:
+                r.read()
+        except Exception as exc:
+            print(f"error: health check failed {health_url}: {exc}", file=sys.stderr)
+            sys.exit(1)
+
+    sep = "\t"
+    compact = lambda o: json.dumps(o, ensure_ascii=False, separators=(",", ":"))
+
+    n = 0
+    with log_path.open("w", encoding="utf-8") as logf:
+        for row in iter_jsonl(data_path):
+            if args.limit and n >= args.limit:
+                break
+            post_id = str(row.get("post_id", ""))
+            instruction = str(row.get("instruction", "")).strip()
+            content = str(row.get("content", "")).strip()
+            if not instruction or not content:
+                line = sep.join(
+                    [
+                        "0.000",
+                        post_id,
+                        compact({"skipped": True}),
+                        compact(content),
+                    ]
+                )
+                logf.write(line + "\n")
+                logf.flush()
+                print(line, flush=True)
+                n += 1
+                continue
+
+            user_content = f"Instruction:\n{instruction}\n\nContent:\n{content}"
+            elapsed, resp = post_chat(
+                args.url,
+                args.model,
+                user_content,
+                args.max_tokens,
+                args.temperature,
+                args.timeout,
+            )
+
+            assistant_text = ""
+            if resp.get("ok") is not False and "error" not in resp:
+                assistant_text = extract_assistant_content(resp)
+            else:
+                assistant_text = ""
+
+            if resp.get("ok") is False or "choices" not in resp:
+                model_out: Any = {
+                    "request_error": resp.get("error", resp),
+                }
+            else:
+                model_out = parse_model_output_json(assistant_text)
+
+            content_json = json.dumps(content, ensure_ascii=False)
+            out_json = compact(model_out)
+            line = sep.join(
+                [
+                    f"{elapsed:.6f}",
+                    post_id,
+                    out_json,
+                    content_json,
+                ]
+            )
+            logf.write(line + "\n")
+            logf.flush()
+            print(line, flush=True)
+            n += 1
+            if args.sleep > 0:
+                time.sleep(args.sleep)
+
+    print(f"done: {n} lines -> {log_path}", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()
