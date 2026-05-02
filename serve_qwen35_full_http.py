@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 import argparse
+import inspect
 import json
-import re
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, Optional
@@ -9,47 +9,100 @@ from typing import Any, Dict, Optional
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+# 必须与 new_mian.py 一致，否则微调权重对不上分布，易出现长废话、不出 JSON
+DEFAULT_SYSTEM_PROMPT = "You are a strict structured information extraction assistant."
+
+
+def _build_user_content(instruction: str, content: str) -> str:
+    return f"Instruction:\n{instruction}\n\nContent:\n{content}"
+
+
+_THINK_END_MARKERS = ("</" + "think" + ">", "</" + "thinking" + ">")
+
+
+def _is_instruction_schema_echo(obj: Dict[str, Any]) -> bool:
+    r = str(obj.get("reasoning", "")).strip().lower()
+    if r in ("briefly state why.", "briefly state why"):
+        return True
+    rels = obj.get("relationships")
+    if not isinstance(rels, list) or len(rels) != 1:
+        return False
+    rel0 = rels[0] if rels else None
+    if not isinstance(rel0, dict):
+        return False
+    if str(rel0.get("brand_text", "")).strip() == "Exact Brand Name":
+        return True
+    return False
+
 
 def _extract_first_json_object(text: str) -> Optional[Dict[str, Any]]:
-    idx = text.find("{")
-    if idx < 0: return None
+    """扫描所有 `{...}`；优先返回含 is_beauty 且非指令示例回显的最后一个 dict。"""
     decoder = json.JSONDecoder()
-    while idx >= 0 and idx < len(text):
+    candidates: list[Dict[str, Any]] = []
+    idx = 0
+    while True:
+        j = text.find("{", idx)
+        if j < 0:
+            break
         try:
-            obj, _ = decoder.raw_decode(text[idx:])
-            if isinstance(obj, dict): return obj
+            obj, end = decoder.raw_decode(text[j:])
+            if isinstance(obj, dict) and (
+                "is_beauty" in obj or isinstance(obj.get("relationships"), list)
+            ):
+                candidates.append(obj)
+            idx = j + max(1, end)
         except Exception:
-            pass
-        idx = text.find("{", idx + 1)
+            idx = j + 1
+    for obj in reversed(candidates):
+        if not _is_instruction_schema_echo(obj):
+            return obj
     return None
 
 
 def _strip_thinking_text(text: str) -> str:
-    for marker in ("Thinking Process:", "</think>"):
-        idx = text.find(marker)
-        if idx >= 0: text = text[:idx]
-    return text.strip()
+    """Qwen3.x：JSON 在 </think> 之后；Thinking Process 段内常有 Schema 的 `{`，需从首个 `{` 起截。"""
+    t = text.strip()
+    for end in _THINK_END_MARKERS:
+        if end in t:
+            t = t[t.rfind(end) + len(end) :].strip()
+    tp = "Thinking Process:"
+    if tp in t:
+        i = t.find(tp)
+        brace = t.find("{", i)
+        if brace >= 0:
+            return t[brace:].strip()
+        return t[:i].strip()
+    return t
 
 
 def _normalize_output(obj: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    if not isinstance(obj, dict): return None
+    if not isinstance(obj, dict):
+        return None
+    rels_pre = obj.get("relationships")
+    if "is_beauty" in obj:
+        inferred_beauty = bool(obj.get("is_beauty"))
+    else:
+        inferred_beauty = isinstance(rels_pre, list) and len(rels_pre) > 0
     out: Dict[str, Any] = {
-        "is_beauty": bool(obj.get("is_beauty", False)),
+        "is_beauty": inferred_beauty,
         "reasoning": str(obj.get("reasoning", "")),
         "relationships": [],
     }
     rels = obj.get("relationships", [])
     if isinstance(rels, list):
         for r in rels:
-            if not isinstance(r, dict): continue
+            if not isinstance(r, dict):
+                continue
             brand = str(r.get("brand_text", "")).strip()
-            if not brand: continue
+            if not brand:
+                continue
             out["relationships"].append({"brand_text": brand, "start": "", "end": ""})
     return out
 
 
 def _postprocess_relationships(obj: Optional[Dict[str, Any]], content: str) -> Optional[Dict[str, Any]]:
-    if not isinstance(obj, dict): return obj
+    if not isinstance(obj, dict):
+        return obj
     rels = obj.get("relationships", [])
     if not isinstance(rels, list):
         obj["relationships"] = []
@@ -62,16 +115,15 @@ def _postprocess_relationships(obj: Optional[Dict[str, Any]], content: str) -> O
 
     for r in rels:
         brand = str(r.get("brand_text", "")).strip()
-        if not brand: continue
+        if not brand:
+            continue
 
-        # 预处理：去掉 @ 符号
         brand_clean = brand[1:].strip() if brand.startswith("@") else brand
         b_l = brand_clean.lower()
 
-        # 过滤掉明显的店铺/官方账号关键词
-        if any(tok in b_l for tok in deny_tokens): continue
+        if any(tok in b_l for tok in deny_tokens):
+            continue
 
-        # 检查是否在原文中出现
         pos = text_l.find(b_l)
         if pos >= 0:
             end = pos + len(brand_clean)
@@ -84,9 +136,15 @@ def _postprocess_relationships(obj: Optional[Dict[str, Any]], content: str) -> O
                     "end": str(end),
                 })
 
-    # 【关键修改】：不再截断为 [:3]，保留所有识别结果
     obj["relationships"] = out
     return obj
+
+
+NO_THINK_PREFIX = "/no_think\n\n"
+JSON_HINT_SUFFIX = (
+    "\n\nAfter brief analysis, output exactly one JSON object matching the schema "
+    "(do not copy the Example Output)."
+)
 
 
 def make_handler(state):
@@ -117,25 +175,40 @@ def make_handler(state):
                 payload = json.loads(self.rfile.read(length).decode("utf-8"))
                 instruction = str(payload.get("instruction", "")).strip()
                 content = str(payload.get("content", "")).strip()
-                max_tokens = int(payload.get("max_new_tokens", args.max_new_tokens))
+                req_max = int(payload.get("max_new_tokens", args.max_new_tokens))
+                max_tokens = max(64, min(req_max, 8192))
+                debug_parse = bool(payload.get("debug_parse"))
+                use_hint = bool(payload.get("append_json_hint", args.append_json_hint))
 
-                # 与 new_mian.py 训练时 chat 模板一致：system 固定，用户消息里放请求体中的 instruction + content
+                user_text = _build_user_content(instruction, content)
+                if use_hint:
+                    user_text = NO_THINK_PREFIX + user_text + JSON_HINT_SUFFIX
+
                 messages = [
-                    {"role": "system", "content": "你是一个严谨的结构化信息抽取助手。"},
-                    {
-                        "role": "user",
-                        "content": f"指令：{instruction}\n\n文本：{content}",
-                    },
+                    {"role": "system", "content": DEFAULT_SYSTEM_PROMPT},
+                    {"role": "user", "content": user_text},
                 ]
-                prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+                tpl_kw: Dict[str, Any] = {}
+                try:
+                    sig = inspect.signature(tokenizer.apply_chat_template)
+                    if "chat_template_kwargs" in sig.parameters:
+                        tpl_kw["chat_template_kwargs"] = {"enable_thinking": False}
+                except (TypeError, ValueError, AttributeError):
+                    pass
+                prompt = tokenizer.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=True, **tpl_kw
+                )
 
                 inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
                 with torch.no_grad():
                     gen = model.generate(**inputs, max_new_tokens=max_tokens, do_sample=False)
 
-                output_text = tokenizer.decode(gen[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
+                output_text = tokenizer.decode(
+                    gen[0][inputs["input_ids"].shape[1] :], skip_special_tokens=True
+                )
 
-                parsed = _extract_first_json_object(_strip_thinking_text(output_text))
+                stripped = _strip_thinking_text(output_text)
+                parsed = _extract_first_json_object(stripped)
                 norm = _normalize_output(parsed)
                 if args.postprocess_relationships:
                     final_json = _postprocess_relationships(norm, content)
@@ -143,11 +216,16 @@ def make_handler(state):
                     final_json = norm
 
                 elapsed_ms = int((time.perf_counter() - t0) * 1000)
-                self._resp(200, {
+                out_body: Dict[str, Any] = {
                     "ok": True,
                     "elapsed_ms": elapsed_ms,
-                    "output_json": final_json
-                })
+                    "output_json": final_json,
+                }
+                if debug_parse:
+                    lim = 12000
+                    out_body["raw_output"] = output_text[:lim]
+                    out_body["stripped_for_json"] = stripped[:lim]
+                self._resp(200, out_body)
             except Exception as e:
                 self._resp(500, {"error": str(e)})
 
@@ -164,14 +242,25 @@ def main():
         action="store_true",
         help="按原文匹配并补 start/end、过滤部分词（默认关闭，与训练标签一致）",
     )
+    parser.add_argument(
+        "--append-json-hint",
+        dest="append_json_hint",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="是否在用户侧加 /no_think 与 JSON 提示（默认开；可用 --no-append-json-hint 关闭）",
+    )
     args = parser.parse_args()
 
     print(f"Loading model: {args.model_path}")
     tokenizer = AutoTokenizer.from_pretrained(args.model_path)
-    model = AutoModelForCausalLM.from_pretrained(args.model_path, torch_dtype=torch.float16, device_map="auto")
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model_path, torch_dtype=torch.float16, device_map="auto"
+    )
 
-    server = ThreadingHTTPServer(("0.0.0.0", args.port),
-                                 make_handler({"tokenizer": tokenizer, "model": model, "args": args}))
+    server = ThreadingHTTPServer(
+        ("0.0.0.0", args.port),
+        make_handler({"tokenizer": tokenizer, "model": model, "args": args}),
+    )
     print(f"Server started at port {args.port}")
     server.serve_forever()
 
