@@ -146,6 +146,9 @@ JSON_HINT_SUFFIX = (
     "(do not copy the Example Output)."
 )
 
+# 低于此值的 max_new_tokens 极易在「思考/前缀」后截断，导致 output_json 为 null
+MIN_EFFECTIVE_MAX_NEW_TOKENS = 512
+
 
 def make_handler(state):
     tokenizer, model, args = state["tokenizer"], state["model"], state["args"]
@@ -176,7 +179,17 @@ def make_handler(state):
                 instruction = str(payload.get("instruction", "")).strip()
                 content = str(payload.get("content", "")).strip()
                 req_max = int(payload.get("max_new_tokens", args.max_new_tokens))
-                max_tokens = max(64, min(req_max, 8192))
+                req_max = max(64, min(req_max, 8192))
+                allow_low = bool(payload.get("allow_under_min_tokens"))
+                if req_max < MIN_EFFECTIVE_MAX_NEW_TOKENS and not allow_low:
+                    max_tokens = MIN_EFFECTIVE_MAX_NEW_TOKENS
+                    token_bump_note = (
+                        f"已将 max_new_tokens 从请求的 {req_max} 提升为 {max_tokens}，"
+                        "避免生成在 JSON 完成前被截断。若坚持用小值请传 allow_under_min_tokens: true。"
+                    )
+                else:
+                    max_tokens = req_max
+                    token_bump_note = ""
                 debug_parse = bool(payload.get("debug_parse"))
                 use_hint = bool(payload.get("append_json_hint", args.append_json_hint))
 
@@ -220,7 +233,10 @@ def make_handler(state):
                     "ok": True,
                     "elapsed_ms": elapsed_ms,
                     "output_json": final_json,
+                    "max_new_tokens_used": max_tokens,
                 }
+                if token_bump_note:
+                    out_body["note"] = token_bump_note
                 if debug_parse:
                     lim = 12000
                     out_body["raw_output"] = output_text[:lim]
