@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """
-逐步遍历 data/train_v2.jsonl，按 vLLM /v1/chat/completions 格式请求（与 val 拼法一致），
-将耗时、post_id、模型返回的 JSON（assistant.content 解析结果）、样本 content 的 JSON 字符串写入日志。
+逐步遍历 data/train_v2.jsonl，按 vLLM /v1/chat/completions 格式请求（Instruction + Content 与 val 一致），
+将耗时、post_id、解析后的结构化 output、以及「接口返回里 message.content 原文」写入日志。
 
-默认日志每行格式（TAB 分隔，便于 cut/awk；字段内无 TAB）：
+默认日志每行格式（TAB 分隔）：
   time_sec<TAB>post_id<TAB>output_json<TAB>content_json
 
-output_json：对 assistant.content 做 json.loads 后的对象再 json.dumps（失败则为 {"parse_error": "..."}）。
-content_json：对数据里的 content 字段 json.dumps，保证一行内为合法 JSON 字符串。
+- time_sec：单次 HTTP 请求耗时（秒）。
+- output_json：对响应 choices[0].message.content 做 json.loads 后的对象再紧凑 json.dumps；
+  若 HTTP/JSON 失败或无法解析，则为错误说明对象。
+- content_json：json.dumps(响应里的 message.content 字符串)，即「请求后返回的正文」的 JSON 字符串形式
+  （与 OpenAI 字段名 content 一致）；无返回时为空字符串的 JSON。
 """
 from __future__ import annotations
 
@@ -157,8 +160,8 @@ def main() -> None:
                     [
                         "0.000",
                         post_id,
-                        compact({"skipped": True}),
-                        compact(content),
+                        compact({"skipped": True, "reason": "missing instruction or content"}),
+                        json.dumps("", ensure_ascii=False),
                     ]
                 )
                 logf.write(line + "\n")
@@ -190,7 +193,8 @@ def main() -> None:
             else:
                 model_out = parse_model_output_json(assistant_text)
 
-            content_json = json.dumps(content, ensure_ascii=False)
+            # 日志最后一列：接口返回的 message.content（JSON 字符串形式），不是训练集里的帖子 content
+            content_json = json.dumps(assistant_text, ensure_ascii=False)
             out_json = compact(model_out)
             line = sep.join(
                 [
