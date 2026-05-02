@@ -8,6 +8,7 @@ Qwen3.5 基座 HTTP 推理：权重从魔搭 ModelScope 拉取（或本机已下
 与 serve_qwen35_full_http.py 的区别：
 - AutoModelForCausalLM.from_pretrained / AutoTokenizer.from_pretrained 仅传路径，
   不指定 torch_dtype、device_map、量化等；
+- 若检测到 CUDA，在加载后将 model `.to(cuda)`，避免默认落在 CPU 上极慢或像卡死；
 - 不在代码里改写 model.config / generation_config；
 - 不使用固定 system prompt、/no_think 后缀、JSON 抽取等任务相关逻辑；
 - 不读取项目内任何数据文件（无 jsonl / 数据集路径）。
@@ -169,6 +170,11 @@ def main() -> None:
     print(f"[vanilla] Loading model (default kwargs): {pretrained}")
     tokenizer = AutoTokenizer.from_pretrained(pretrained)
     model = AutoModelForCausalLM.from_pretrained(pretrained)
+    if torch.cuda.is_available():
+        model = model.to(torch.device("cuda"))
+        print("[vanilla] model device: cuda")
+    else:
+        print("[vanilla] WARNING: CUDA 不可用，推理在 CPU 上会极慢")
     model.eval()
 
     handler = make_handler(tokenizer, model)
