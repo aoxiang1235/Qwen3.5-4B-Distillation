@@ -158,7 +158,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_path", type=str, required=True)
     parser.add_argument("--port", type=int, default=8000)
-    parser.add_argument("--max_new_tokens", type=int, default=512)
+    parser.add_argument("--max_new_tokens", type=int, default=2048)
     parser.add_argument(
         "--postprocess_relationships",
         action="store_true",
