@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """
 逐步遍历 data/train_v2.jsonl，按 vLLM /v1/chat/completions 格式请求（Instruction + Content 与 val 一致），
-将耗时、post_id、解析后的结构化 output、以及「接口返回里 message.content 原文」写入日志。
+将耗时、post_id、数据集中的标注 output、以及接口返回的 message.content 写入日志。
 
 默认日志每行格式（TAB 分隔）：
   time_sec<TAB>post_id<TAB>output_json<TAB>content_json
 
-- time_sec：单次 HTTP 请求耗时（秒）。
-- output_json：对响应 choices[0].message.content 做 json.loads 后的对象再紧凑 json.dumps；
-  若 HTTP/JSON 失败或无法解析，则为错误说明对象。
-- content_json：默认 json.dumps(响应里的 message.content)，便于整列用 json.loads 还原；
-  加 --content-plain 时改为「原文」：不做 JSON 转义，仅把 TAB/CR/LF 换成空格，保证一行一条 TSV。
+- time_sec：单次 HTTP 请求耗时（秒）；跳过请求时为 0。
+- output_json：来自 jsonl 行里的「output」字段（dict/list）经紧凑 json.dumps；缺失或类型不对时
+  为 {"missing_or_invalid_output_field": ...}。
+- content_json：vLLM 响应 choices[0].message.content（请求后的模型原文）；默认 json.dumps 包一层；
+  加 --content-plain 时去掉 JSON 转义并把 TAB/换行压成空格。
 """
 from __future__ import annotations
 
@@ -18,10 +18,9 @@ import argparse
 import json
 import sys
 import time
-import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Any, Dict, Iterator, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, Tuple
 
 
 def iter_jsonl(path: Path) -> Iterator[Dict[str, Any]]:
@@ -83,27 +82,19 @@ def extract_assistant_content(resp: Dict[str, Any]) -> str:
     return c if isinstance(c, str) else ""
 
 
-def parse_model_output_json(text: str) -> Any:
-    if not text.strip():
-        return {"parse_error": "empty_content"}
-    t = text.strip()
-    if t.startswith("```"):
-        lines = t.split("\n")
-        if len(lines) >= 2 and lines[0].startswith("```"):
-            t = "\n".join(lines[1:])
-        if t.rstrip().endswith("```"):
-            t = t.rstrip()[:-3].rstrip()
-    try:
-        return json.loads(t)
-    except json.JSONDecodeError as exc:
-        return {"parse_error": str(exc), "raw": text[:2000]}
-
-
 def format_content_log_field(text: str, plain: bool) -> str:
     """第四列：plain 时去掉 JSON 层面的转义写法，便于肉眼读；否则为合法 JSON 字符串字面量。"""
     if plain:
         return text.replace("\t", " ").replace("\r", " ").replace("\n", " ")
     return json.dumps(text, ensure_ascii=False)
+
+
+def dataset_output_compact(row: Dict[str, Any], compact_fn: Callable[[Any], str]) -> str:
+    """第三列：train_v2.jsonl 的 output 字段（标注 JSON），紧凑序列化。"""
+    v = row.get("output")
+    if isinstance(v, (dict, list)):
+        return compact_fn(v)
+    return compact_fn({"missing_or_invalid_output_field": v})
 
 
 def main() -> None:
@@ -172,7 +163,7 @@ def main() -> None:
                     [
                         "0.000",
                         post_id,
-                        compact({"skipped": True, "reason": "missing instruction or content"}),
+                        dataset_output_compact(row, compact),
                         format_content_log_field("", args.content_plain),
                     ]
                 )
@@ -198,16 +189,9 @@ def main() -> None:
             else:
                 assistant_text = ""
 
-            if resp.get("ok") is False or "choices" not in resp:
-                model_out: Any = {
-                    "request_error": resp.get("error", resp),
-                }
-            else:
-                model_out = parse_model_output_json(assistant_text)
-
-            # 日志最后一列：接口返回的 message.content（默认 JSON 字符串；--content-plain 则去 JSON 转义、压成单行）
+            # 第三列：数据集中的 output（标注）；第四列：接口返回的 message.content
+            out_json = dataset_output_compact(row, compact)
             content_json = format_content_log_field(assistant_text, args.content_plain)
-            out_json = compact(model_out)
             line = sep.join(
                 [
                     f"{elapsed:.6f}",
