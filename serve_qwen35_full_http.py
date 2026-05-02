@@ -96,13 +96,21 @@ def make_handler(state):
         def _resp(self, status, payload):
             body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
             self.send_response(status)
-            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
 
+        def do_GET(self):  # noqa: N802
+            if self.path == "/health":
+                self._resp(200, {"ok": True, "mode": "fp16"})
+                return
+            self._resp(404, {"error": "not_found"})
+
         def do_POST(self):
-            if self.path != "/generate": return
+            if self.path != "/generate":
+                self._resp(404, {"error": "not_found"})
+                return
             t0 = time.perf_counter()
             try:
                 length = int(self.headers.get("Content-Length", "0"))
