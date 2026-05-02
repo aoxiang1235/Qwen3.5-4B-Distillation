@@ -9,8 +9,8 @@
 - time_sec：单次 HTTP 请求耗时（秒）。
 - output_json：对响应 choices[0].message.content 做 json.loads 后的对象再紧凑 json.dumps；
   若 HTTP/JSON 失败或无法解析，则为错误说明对象。
-- content_json：json.dumps(响应里的 message.content 字符串)，即「请求后返回的正文」的 JSON 字符串形式
-  （与 OpenAI 字段名 content 一致）；无返回时为空字符串的 JSON。
+- content_json：默认 json.dumps(响应里的 message.content)，便于整列用 json.loads 还原；
+  加 --content-plain 时改为「原文」：不做 JSON 转义，仅把 TAB/CR/LF 换成空格，保证一行一条 TSV。
 """
 from __future__ import annotations
 
@@ -99,6 +99,13 @@ def parse_model_output_json(text: str) -> Any:
         return {"parse_error": str(exc), "raw": text[:2000]}
 
 
+def format_content_log_field(text: str, plain: bool) -> str:
+    """第四列：plain 时去掉 JSON 层面的转义写法，便于肉眼读；否则为合法 JSON 字符串字面量。"""
+    if plain:
+        return text.replace("\t", " ").replace("\r", " ").replace("\n", " ")
+    return json.dumps(text, ensure_ascii=False)
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description="train_v2.jsonl -> vLLM chat bench + log")
     p.add_argument("--data", type=str, default="data/train_v2.jsonl")
@@ -119,6 +126,11 @@ def main() -> None:
         "--skip-health",
         action="store_true",
         help="跳过启动前对 base URL 的 GET /health（仅去掉 /v1/chat/completions 后缀测端口）",
+    )
+    p.add_argument(
+        "--content-plain",
+        action="store_true",
+        help="第四列不用 json.dumps，直接写 message.content 原文；TAB/换行改为空格（无 \\\\n \\\" 等 JSON 转义）",
     )
     args = p.parse_args()
 
@@ -161,7 +173,7 @@ def main() -> None:
                         "0.000",
                         post_id,
                         compact({"skipped": True, "reason": "missing instruction or content"}),
-                        json.dumps("", ensure_ascii=False),
+                        format_content_log_field("", args.content_plain),
                     ]
                 )
                 logf.write(line + "\n")
@@ -193,8 +205,8 @@ def main() -> None:
             else:
                 model_out = parse_model_output_json(assistant_text)
 
-            # 日志最后一列：接口返回的 message.content（JSON 字符串形式），不是训练集里的帖子 content
-            content_json = json.dumps(assistant_text, ensure_ascii=False)
+            # 日志最后一列：接口返回的 message.content（默认 JSON 字符串；--content-plain 则去 JSON 转义、压成单行）
+            content_json = format_content_log_field(assistant_text, args.content_plain)
             out_json = compact(model_out)
             line = sep.join(
                 [
