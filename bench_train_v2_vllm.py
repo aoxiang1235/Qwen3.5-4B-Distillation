@@ -125,8 +125,8 @@ def dataset_output_compact(row: Dict[str, Any], compact_fn: Callable[[Any], str]
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description="train_v2.jsonl -> vLLM chat bench + log")
-    p.add_argument("--data", type=str, default="data/train_v2.jsonl")
+    p = argparse.ArgumentParser(description="val.jsonl -> vLLM chat bench + log")
+    p.add_argument("--data", type=str, default="data/val.jsonl")
     p.add_argument(
         "--url",
         type=str,
