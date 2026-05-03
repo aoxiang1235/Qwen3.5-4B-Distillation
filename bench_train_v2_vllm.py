@@ -71,6 +71,29 @@ def post_chat(
         return elapsed, {"ok": False, "error": "invalid_json_response", "raw": text[:4000]}
 
 
+def _message_content_to_str(raw: Any) -> str:
+    """OpenAI / vLLM 里 message.content 可能是 str、null、或多段 list。"""
+    if raw is None:
+        return ""
+    if isinstance(raw, str):
+        return raw
+    if isinstance(raw, list):
+        parts: list[str] = []
+        for item in raw:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                t = item.get("type")
+                if t == "text" and isinstance(item.get("text"), str):
+                    parts.append(item["text"])
+                elif isinstance(item.get("text"), str):
+                    parts.append(item["text"])
+        return "".join(parts)
+    if isinstance(raw, dict) and isinstance(raw.get("text"), str):
+        return raw["text"]
+    return ""
+
+
 def extract_assistant_content(resp: Dict[str, Any]) -> str:
     choices = resp.get("choices")
     if not isinstance(choices, list) or not choices:
@@ -79,7 +102,10 @@ def extract_assistant_content(resp: Dict[str, Any]) -> str:
     if not isinstance(msg, dict):
         return ""
     c = msg.get("content")
-    return c if isinstance(c, str) else ""
+    s = _message_content_to_str(c)
+    if not s and isinstance(msg.get("reasoning_content"), str):
+        s = msg["reasoning_content"]
+    return s
 
 
 def format_content_log_field(text: str, plain: bool) -> str:
@@ -98,8 +124,8 @@ def dataset_output_compact(row: Dict[str, Any], compact_fn: Callable[[Any], str]
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description="val_v2.jsonl -> vLLM chat bench + log")
-    p.add_argument("--data", type=str, default="data/val_v2.jsonl")
+    p = argparse.ArgumentParser(description="train_v2.jsonl -> vLLM chat bench + log")
+    p.add_argument("--data", type=str, default="data/train_v2.jsonl")
     p.add_argument(
         "--url",
         type=str,
@@ -183,11 +209,11 @@ def main() -> None:
                 args.timeout,
             )
 
-            assistant_text = ""
-            if resp.get("ok") is not False and "error" not in resp:
-                assistant_text = extract_assistant_content(resp)
-            else:
-                assistant_text = ""
+            # 仅 post_chat 失败时带 ok: False；成功响应里若存在 error: null，"error" in resp 仍为 True，
+            # 旧逻辑会误跳过提取，导致 content_json 恒为 ""。
+            assistant_text = (
+                "" if resp.get("ok") is False else extract_assistant_content(resp)
+            )
 
             # 第三列：数据集中的 output（标注）；第四列：接口返回的 message.content
             out_json = dataset_output_compact(row, compact)
