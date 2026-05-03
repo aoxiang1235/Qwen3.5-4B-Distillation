@@ -2,6 +2,7 @@
 """
 逐步遍历 data/train_v2.jsonl，按 vLLM /v1/chat/completions 格式请求（Instruction + Content 与 val 一致），
 将耗时、post_id、数据集中的标注 output、以及接口返回的 message.content 写入日志。
+可选 --instruction-file：用固定 UTF-8 提示词覆盖每条样本的 instruction（仅换 content）。
 
 默认日志每行格式（TAB 分隔）：
   time_sec<TAB>post_id<TAB>output_json<TAB>content_json
@@ -149,7 +150,24 @@ def main() -> None:
         action="store_true",
         help="第四列不用 json.dumps，直接写 message.content 原文；TAB/换行改为空格（无 \\\\n \\\" 等 JSON 转义）",
     )
+    p.add_argument(
+        "--instruction-file",
+        type=str,
+        default="",
+        help="若非空：从该 UTF-8 文件读取整段作为 instruction，忽略 JSONL 里的 instruction 字段",
+    )
     args = p.parse_args()
+
+    fixed_instruction = ""
+    if str(args.instruction_file).strip():
+        inst_path = Path(args.instruction_file)
+        if not inst_path.is_file():
+            print(f"error: --instruction-file 不是有效文件: {inst_path}", file=sys.stderr)
+            sys.exit(1)
+        fixed_instruction = inst_path.read_text(encoding="utf-8").strip()
+        if not fixed_instruction:
+            print(f"error: 提示词文件为空: {inst_path}", file=sys.stderr)
+            sys.exit(1)
 
     data_path = Path(args.data)
     if not data_path.is_file():
@@ -182,7 +200,11 @@ def main() -> None:
             if args.limit and n >= args.limit:
                 break
             post_id = str(row.get("post_id", ""))
-            instruction = str(row.get("instruction", "")).strip()
+            instruction = (
+                fixed_instruction
+                if fixed_instruction
+                else str(row.get("instruction", "")).strip()
+            )
             content = str(row.get("content", "")).strip()
             if not instruction or not content:
                 line = sep.join(
