@@ -10,8 +10,8 @@
 - time_sec：单次 HTTP 请求耗时（秒）；跳过请求时为 0。
 - output_json：来自 jsonl 行里的「output」字段（dict/list）经紧凑 json.dumps；缺失或类型不对时
   为 {"missing_or_invalid_output_field": ...}。
-- content_json：vLLM 响应 choices[0].message.content（请求后的模型原文）；默认 json.dumps 包一层；
-  加 --content-plain 时去掉 JSON 转义并把 TAB/换行压成空格。
+- content_json：优先为模型正文 choices[0].message.content（json.dumps 包一层）；--content-plain 时压成单行。
+  若正文为空：失败请求写入 {"http_layer_error", "raw_head"}；成功但无正文则写入 {"assistant_text_empty", "message"|"choice0"} 便于对照原始返回。
 """
 from __future__ import annotations
 
@@ -21,7 +21,9 @@ import sys
 import time
 import urllib.request
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterator, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
+
+_BENCH_FAILED = "_bench_http_failed"
 
 
 def iter_jsonl(path: Path) -> Iterator[Dict[str, Any]]:
@@ -44,12 +46,13 @@ def post_chat(
     temperature: float,
     timeout_sec: float,
 ) -> Tuple[float, Dict[str, Any]]:
-    """返回 (elapsed_seconds, response_json_dict)。HTTP 非 2xx 或非法 JSON 时 dict 内含 ok: false。"""
+    """失败时 dict 带 _bench_http_failed（避免与 API 自带的 ok/error 键冲突）。"""
     body: Dict[str, Any] = {
         "model": model,
         "messages": [{"role": "user", "content": user_content}],
         "temperature": temperature,
         "max_tokens": max_tokens,
+        "stream": False,
     }
     raw_b = json.dumps(body, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(
@@ -64,12 +67,74 @@ def post_chat(
             text = resp.read().decode("utf-8")
     except Exception as exc:
         elapsed = time.perf_counter() - t0
-        return elapsed, {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+        return elapsed, {
+            _BENCH_FAILED: True,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
     elapsed = time.perf_counter() - t0
+    parsed, err = parse_openai_chat_response_text(text)
+    if parsed is not None:
+        return elapsed, parsed
+    return elapsed, {
+        _BENCH_FAILED: True,
+        "error": err or "invalid_json_response",
+        "raw": text[:4000],
+    }
+
+
+def parse_openai_chat_response_text(text: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """整段 JSON，或 SSE `data: {...}` 流（拼接 delta.content）。"""
+    text = text.strip()
+    if not text:
+        return None, "empty_response_body"
     try:
-        return elapsed, json.loads(text)
+        return json.loads(text), None
     except json.JSONDecodeError:
-        return elapsed, {"ok": False, "error": "invalid_json_response", "raw": text[:4000]}
+        pass
+
+    merged_delta: List[str] = []
+    last_obj: Optional[Dict[str, Any]] = None
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith("data:"):
+            continue
+        payload = line[5:].strip()
+        if payload == "[DONE]":
+            break
+        try:
+            obj = json.loads(payload)
+        except json.JSONDecodeError:
+            continue
+        last_obj = obj
+        choices = obj.get("choices")
+        if not isinstance(choices, list) or not choices:
+            continue
+        ch0 = choices[0]
+        if not isinstance(ch0, dict):
+            continue
+        delta = ch0.get("delta")
+        if isinstance(delta, dict):
+            c = delta.get("content")
+            if isinstance(c, str) and c:
+                merged_delta.append(c)
+
+    if merged_delta:
+        return (
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": "".join(merged_delta),
+                        }
+                    }
+                ]
+            },
+            None,
+        )
+    if last_obj is not None:
+        return last_obj, None
+    return None, "invalid_json_response"
 
 
 def _message_content_to_str(raw: Any) -> str:
@@ -99,14 +164,51 @@ def extract_assistant_content(resp: Dict[str, Any]) -> str:
     choices = resp.get("choices")
     if not isinstance(choices, list) or not choices:
         return ""
-    msg = choices[0].get("message") if isinstance(choices[0], dict) else None
+    ch0 = choices[0]
+    if not isinstance(ch0, dict):
+        return ""
+    tx = ch0.get("text")
+    if isinstance(tx, str) and tx.strip():
+        return tx
+    msg = ch0.get("message")
     if not isinstance(msg, dict):
         return ""
     c = msg.get("content")
     s = _message_content_to_str(c)
-    if not s and isinstance(msg.get("reasoning_content"), str):
-        s = msg["reasoning_content"]
+    if not s:
+        rc = msg.get("reasoning_content")
+        if isinstance(rc, str):
+            s = rc
+        elif isinstance(rc, list):
+            s = _message_content_to_str(rc)
     return s
+
+
+def content_json_column(
+    resp: Dict[str, Any],
+    assistant_text: str,
+    plain: bool,
+    compact_fn: Callable[[Any], str],
+) -> str:
+    """第四列：有模型正文则按原规则；否则写入紧凑 JSON 说明返回里剩了什么。"""
+    if assistant_text:
+        return format_content_log_field(assistant_text, plain)
+    if resp.get(_BENCH_FAILED):
+        return compact_fn(
+            {
+                "http_layer_error": resp.get("error"),
+                "raw_head": (resp.get("raw") or "")[:1200],
+            }
+        )
+    ch = resp.get("choices")
+    if isinstance(ch, list) and ch and isinstance(ch[0], dict):
+        return compact_fn(
+            {
+                "assistant_text_empty": True,
+                "choice0": ch[0],
+            }
+        )
+    return compact_fn({"assistant_text_empty": True, "no_choices": True, "keys": sorted(resp.keys())})
 
 
 def format_content_log_field(text: str, plain: bool) -> str:
@@ -232,15 +334,15 @@ def main() -> None:
                 args.timeout,
             )
 
-            # 仅 post_chat 失败时带 ok: False；成功响应里若存在 error: null，"error" in resp 仍为 True，
-            # 旧逻辑会误跳过提取，导致 content_json 恒为 ""。
             assistant_text = (
-                "" if resp.get("ok") is False else extract_assistant_content(resp)
+                "" if resp.get(_BENCH_FAILED) else extract_assistant_content(resp)
             )
 
-            # 第三列：数据集中的 output（标注）；第四列：接口返回的 message.content
+            # 第三列：数据集中的 output（标注）；第四列：模型正文，或空时的回退 JSON
             out_json = dataset_output_compact(row, compact)
-            content_json = format_content_log_field(assistant_text, args.content_plain)
+            content_json = content_json_column(
+                resp, assistant_text, args.content_plain, compact
+            )
             line = sep.join(
                 [
                     f"{elapsed:.6f}",
