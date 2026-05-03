@@ -319,6 +319,7 @@ def create_model(
         torch_dtype=dtype_map[model_dtype],
         quantization_config=quant_config,
         device_map="auto",
+        trust_remote_code=True,
     )
     if use_4bit:
         model = prepare_model_for_kbit_training(model)
@@ -592,7 +593,9 @@ def main():
 
     pretrained = resolve_pretrained_path(args)
     print(f"[3/5] 加载 tokenizer/model: {args.model_name} -> {pretrained}")
-    tokenizer = AutoTokenizer.from_pretrained(pretrained, use_fast=False)
+    tokenizer = AutoTokenizer.from_pretrained(
+        pretrained, use_fast=False, trust_remote_code=True
+    )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.truncation_side = "left"
