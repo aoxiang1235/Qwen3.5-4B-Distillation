@@ -1,10 +1,6 @@
 #!/usr/bin/env python3
 """
 将 training_data_4B.xlsx 转换为训练用 JSONL（instruction/content/output）。
-
-默认生成 data/train.jsonl、data/val.jsonl（无字符偏移）。
-加 --v3 时生成 train_v3.jsonl / val_v3.jsonl：relationships 每项含 start/end（半开区间）；
-在正文中找不到子串时仍保留该条，start=end=-1（与「不丢弃 relationship」一致）。
 """
 
 import argparse
@@ -13,7 +9,6 @@ import os
 import random
 import zipfile
 from collections import defaultdict
-from pathlib import Path
 from typing import Dict, List, Tuple
 import xml.etree.ElementTree as ET
 
@@ -96,33 +91,7 @@ def parse_bool(value: str) -> bool:
     return text in {"1", "true", "yes", "y"}
 
 
-def find_brand_char_span(content: str, brand_text: str) -> Tuple[int, int]:
-    """
-    在 content 中为 brand_text 找一段 [start, end) 的字符偏移（与 Python 下标一致）。
-    先精确子串，再大小写不敏感；找不到返回 (-1, -1)，调用方仍保留 relationship。
-    """
-    if not brand_text:
-        return (-1, -1)
-    n = len(content)
-    i = content.find(brand_text)
-    if i >= 0:
-        e = i + len(brand_text)
-        if 0 <= i < e <= n:
-            return (i, e)
-    lo_c, lo_b = content.lower(), brand_text.lower()
-    j = lo_c.find(lo_b)
-    if j >= 0:
-        e = j + len(brand_text)
-        if 0 <= j < e <= n:
-            return (j, e)
-    return (-1, -1)
-
-
-def build_samples(
-    rows: List[Dict[str, str]],
-    instruction: str,
-    with_offsets: bool = False,
-) -> Tuple[List[Dict], Dict[str, int]]:
+def build_samples(rows: List[Dict[str, str]], instruction: str) -> Tuple[List[Dict], Dict[str, int]]:
     groups: Dict[Tuple[str, str], List[Dict[str, str]]] = defaultdict(list)
     for row in rows:
         content = str(row.get("content") or row.get("clean_text") or "").strip()
@@ -133,13 +102,11 @@ def build_samples(
 
     samples: List[Dict] = []
     multi_rel = 0
-    rel_with_span = 0
-    rel_missing_span = 0
 
     for (post_id, content), items in groups.items():
         is_beauty = any(parse_bool(row.get("is_beauty", "")) for row in items)
         reasoning = ""
-        brands_ordered: List[str] = []
+        relationships = []
         seen = set()
 
         for row in items:
@@ -155,25 +122,13 @@ def build_samples(
             if key in seen:
                 continue
             seen.add(key)
-            brands_ordered.append(brand_text)
-
-        relationships: List[Dict] = []
-        if is_beauty:
-            for brand_text in brands_ordered:
-                if with_offsets:
-                    start, end = find_brand_char_span(content, brand_text)
-                    if start >= 0 and end >= 0:
-                        rel_with_span += 1
-                    else:
-                        rel_missing_span += 1
-                    relationships.append(
-                        {"brand_text": brand_text, "start": start, "end": end}
-                    )
-                else:
-                    relationships.append({"brand_text": brand_text})
+            relationships.append({"brand_text": brand_text})
 
         if len(relationships) > 1:
             multi_rel += 1
+
+        if not is_beauty:
+            relationships = []
 
         output = {
             "is_beauty": is_beauty,
@@ -189,25 +144,15 @@ def build_samples(
             }
         )
 
-    stats: Dict[str, int] = {
+    stats = {
         "groups": len(groups),
         "samples": len(samples),
         "multi_relationship_samples": multi_rel,
     }
-    if with_offsets:
-        stats["relationships_with_span"] = rel_with_span
-        stats["relationships_missing_span"] = rel_missing_span
     return samples, stats
 
 
-def split_and_write(
-    samples: List[Dict],
-    out_dir: str,
-    val_ratio: float,
-    seed: int,
-    train_name: str = "train.jsonl",
-    val_name: str = "val.jsonl",
-) -> None:
+def split_and_write(samples: List[Dict], out_dir: str, val_ratio: float, seed: int) -> None:
     random.seed(seed)
     random.shuffle(samples)
     val_size = max(1, int(len(samples) * val_ratio))
@@ -215,8 +160,8 @@ def split_and_write(
     train = samples[val_size:]
 
     os.makedirs(out_dir, exist_ok=True)
-    train_path = os.path.join(out_dir, train_name)
-    val_path = os.path.join(out_dir, val_name)
+    train_path = os.path.join(out_dir, "train.jsonl")
+    val_path = os.path.join(out_dir, "val.jsonl")
 
     with open(train_path, "w", encoding="utf-8") as f:
         for row in train:
@@ -226,8 +171,8 @@ def split_and_write(
         for row in val:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
-    print(f"{train_name}: {len(train)} -> {train_path}")
-    print(f"{val_name}:   {len(val)} -> {val_path}")
+    print(f"train.jsonl: {len(train)} -> {train_path}")
+    print(f"val.jsonl:   {len(val)} -> {val_path}")
 
 
 def parse_args():
@@ -237,17 +182,6 @@ def parse_args():
     parser.add_argument("--val_ratio", type=float, default=0.02)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--instruction", type=str, default=DEFAULT_INSTRUCTION)
-    parser.add_argument(
-        "--v3",
-        action="store_true",
-        help="生成 train_v3.jsonl / val_v3.jsonl，relationships 含 start/end；找不到则为 -1，仍保留条目",
-    )
-    parser.add_argument(
-        "--instruction-file",
-        type=str,
-        default="",
-        help="与 --v3 联用：UTF-8 提示词文件；留空则使用 data/prompts/brand_extraction_fixed_offsets.txt",
-    )
     return parser.parse_args()
 
 
@@ -258,39 +192,12 @@ def main():
 
     rows = load_excel_rows(args.xlsx_path)
     print(f"excel rows: {len(rows)}")
-
-    if args.v3:
-        inst_path = Path(
-            (args.instruction_file or "").strip()
-            or "data/prompts/brand_extraction_fixed_offsets.txt"
-        )
-        if not inst_path.is_file():
-            raise FileNotFoundError(f"--v3 需要 instruction 文件，找不到: {inst_path}")
-        instruction = inst_path.read_text(encoding="utf-8").rstrip("\n")
-        if not instruction:
-            raise ValueError(f"instruction 文件为空: {inst_path}")
-        samples, stats = build_samples(
-            rows, instruction=instruction, with_offsets=True
-        )
-        train_name, val_name = "train_v3.jsonl", "val_v3.jsonl"
-    else:
-        samples, stats = build_samples(
-            rows, instruction=args.instruction, with_offsets=False
-        )
-        train_name, val_name = "train.jsonl", "val.jsonl"
-
+    samples, stats = build_samples(rows, instruction=args.instruction)
     print("stats:", json.dumps(stats, ensure_ascii=False))
 
     if len(samples) < 100:
         raise RuntimeError("可用样本过少，请先检查数据映射。")
-    split_and_write(
-        samples,
-        out_dir=args.out_dir,
-        val_ratio=args.val_ratio,
-        seed=args.seed,
-        train_name=train_name,
-        val_name=val_name,
-    )
+    split_and_write(samples, out_dir=args.out_dir, val_ratio=args.val_ratio, seed=args.seed)
 
 
 if __name__ == "__main__":
