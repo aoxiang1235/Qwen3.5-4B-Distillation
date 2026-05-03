@@ -516,6 +516,12 @@ def parse_args():
         help="关闭 ReadableMetricsCallback 的单行 loss/lr 打印（仍写 Trainer 默认日志）",
     )
     parser.add_argument(
+        "--dataloader_num_workers",
+        type=int,
+        default=4,
+        help="训练/验证 DataLoader 的 worker 数；云上可调大（如 8）减轻 GPU 等 batch",
+    )
+    parser.add_argument(
         "--max_train_samples",
         type=int,
         default=0,
@@ -673,6 +679,7 @@ def main():
         f"epochs={args.epochs} max_steps={args.max_steps} max_length={args.max_length} "
         f"logging_steps={log_steps} eval_steps={args.eval_steps} save_steps={args.save_steps} "
         f"use_4bit={args.use_4bit} model_dtype={args.model_dtype} "
+        f"dataloader_num_workers={args.dataloader_num_workers} "
         f"train_samples={len(tokenized['train'])} val_samples={len(tokenized['validation'])} "
         f"max_train_samples={args.max_train_samples or 'all'} max_val_samples={args.max_val_samples or 'all'}",
         flush=True,
@@ -695,6 +702,17 @@ def main():
         _log_extra["logging_first_step"] = True
     if "log_level" in _ta:
         _log_extra["log_level"] = "info"
+    # CUDA + fp16 权重时开启 Trainer 侧 fp16，便于用 Tensor Core；4bit 路径保持关闭
+    _trainer_fp16 = (
+        torch.cuda.is_available()
+        and args.model_dtype == "float16"
+        and not args.use_4bit
+    )
+    _loader_kw: Dict[str, Any] = {}
+    if "dataloader_num_workers" in _ta:
+        _loader_kw["dataloader_num_workers"] = max(0, args.dataloader_num_workers)
+    if "dataloader_pin_memory" in _ta and torch.cuda.is_available():
+        _loader_kw["dataloader_pin_memory"] = True
     training_args = TrainingArguments(
         output_dir=args.output_dir,
         num_train_epochs=args.epochs,
@@ -709,13 +727,14 @@ def main():
         logging_steps=log_steps,
         warmup_ratio=0.03,
         bf16=False,
-        fp16=False,
+        fp16=_trainer_fp16,
         max_grad_norm=args.max_grad_norm,
         save_total_limit=3,
         load_best_model_at_end=True,
         metric_for_best_model="eval_loss",
         greater_is_better=False,
         report_to="none",
+        **_loader_kw,
         **_log_extra,
     )
 
