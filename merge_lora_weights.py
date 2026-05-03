@@ -1,90 +1,97 @@
 #!/usr/bin/env python3
 """
-将 PEFT LoRA 适配器合并进基座权重，得到可单独 from_pretrained 的完整模型目录（方案 C）。
+将 LoRA 适配器合并进基座模型（PEFT merge_and_unload），写出完整权重目录。
 
-依赖：pip install transformers peft accelerate safetensors torch
+典型用途：
+- `new_mian.py` / 其他脚本训练后目录里只有 adapter + 配置，需要单目录全量权重给
+  `transformers` 直接 `from_pretrained`，或给部分推理栈做「全量 FP16 部署」。
 
-典型用法（云上 / 本机）：
-  python3 merge_lora_weights.py \\
-    --base_model Qwen/Qwen2.5-3B-Instruct \\
-    --adapter ./training_runs/lora_qwen25_3b_train/checkpoint-500 \\
-    --out ./merged_models/beauty_brand_merged \\
-    --dtype float16
-
-合并后用 vLLM 直接加载 --model 指向 --out 目录即可，无需再挂 LoRA。
+注意：
+- 合并应在「非 4bit 量化」基座上完成；若训练时用了 4bit，请用同一基座的 FP16/BF16
+  重新加载再挂 adapter 后合并（本脚本默认 float16）。
+- 合并后体积约等于「基座 + 少量元数据」，请预留磁盘空间。
 """
 from __future__ import annotations
 
 import argparse
+import os
 import sys
+
+import torch
+from peft import PeftModel
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description="LoRA adapter + base -> merged full weights (HF folder)")
+    p = argparse.ArgumentParser(description="LoRA adapter -> merged full weights")
     p.add_argument(
         "--base_model",
         type=str,
         required=True,
-        help="基座：HF Hub id 或本地目录（需与训练时一致）",
+        help="基座模型：HF id 或本机目录（须与训练 adapter 时一致）",
     )
     p.add_argument(
-        "--adapter",
+        "--adapter_path",
         type=str,
         required=True,
-        help="LoRA 输出目录（含 adapter_config.json；多为 checkpoint-*/ 子目录）",
+        help="含 adapter 权重的目录（一般为训练 output_dir / checkpoint-*）",
     )
     p.add_argument(
-        "--out",
+        "--output_dir",
         type=str,
         required=True,
-        help="合并后保存目录（将新建）",
+        help="合并后保存目录（将新建/覆盖同名文件）",
     )
     p.add_argument(
-        "--dtype",
+        "--torch_dtype",
         type=str,
+        choices=["float16", "bfloat16", "float32"],
         default="float16",
-        choices=("float16", "bfloat16", "float32"),
-        help="合并后权重 dtype；无 bf16 的 GPU 请用 float16",
+        help="加载与写出时的 torch dtype（合并勿用 4bit）",
     )
     p.add_argument(
-        "--device-map",
+        "--device_map",
         type=str,
         default="auto",
-        help="传给 from_pretrained 的 device_map，默认 auto",
+        help="传给 from_pretrained，默认 auto（多卡可 auto）",
     )
     args = p.parse_args()
 
-    import torch
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-    from peft import PeftModel
-
-    dt = {
+    dtype_map = {
         "float16": torch.float16,
         "bfloat16": torch.bfloat16,
         "float32": torch.float32,
-    }[args.dtype]
+    }
+    torch_dtype = dtype_map[args.torch_dtype]
 
-    print(f"[merge] load base: {args.base_model}", flush=True)
-    model = AutoModelForCausalLM.from_pretrained(
+    if not os.path.isdir(args.adapter_path):
+        print(f"error: adapter_path 不是目录: {args.adapter_path}", file=sys.stderr)
+        sys.exit(1)
+
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    print(f"加载基座: {args.base_model} ({args.torch_dtype})")
+    base = AutoModelForCausalLM.from_pretrained(
         args.base_model,
-        torch_dtype=dt,
+        torch_dtype=torch_dtype,
         device_map=args.device_map,
         trust_remote_code=True,
     )
-    print(f"[merge] load adapter: {args.adapter}", flush=True)
-    model = PeftModel.from_pretrained(model, args.adapter, torch_dtype=dt)
-    print("[merge] merge_and_unload() ...", flush=True)
-    model = model.merge_and_unload()
-    print(f"[merge] save -> {args.out}", flush=True)
-    model.save_pretrained(args.out, safe_serialization=True)
+    print(f"加载适配器: {args.adapter_path}")
+    model = PeftModel.from_pretrained(base, args.adapter_path, is_trainable=False)
+    print("merge_and_unload() …")
+    merged = model.merge_and_unload()
+    print(f"保存到: {args.output_dir}")
+    merged.save_pretrained(args.output_dir, safe_serialization=True)
 
-    tok = AutoTokenizer.from_pretrained(args.base_model, trust_remote_code=True)
-    tok.save_pretrained(args.out)
-    print("[merge] done. 可用 vLLM: vllm serve <out> --trust-remote-code", flush=True)
+    tok_src = args.adapter_path
+    if not os.path.isfile(os.path.join(tok_src, "tokenizer_config.json")):
+        tok_src = args.base_model
+    print(f"保存 tokenizer（来源: {tok_src}）")
+    tokenizer = AutoTokenizer.from_pretrained(tok_src, trust_remote_code=True)
+    tokenizer.save_pretrained(args.output_dir)
+    print("完成。")
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        sys.exit(130)
+    main()
