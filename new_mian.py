@@ -515,6 +515,18 @@ def parse_args():
         action="store_true",
         help="关闭 ReadableMetricsCallback 的单行 loss/lr 打印（仍写 Trainer 默认日志）",
     )
+    parser.add_argument(
+        "--max_train_samples",
+        type=int,
+        default=0,
+        help=">0 时仅用训练集前 N 条（tokenize 前截断），加快扫参；0=全量",
+    )
+    parser.add_argument(
+        "--max_val_samples",
+        type=int,
+        default=0,
+        help=">0 时仅用验证集前 N 条；0=全量",
+    )
     return parser.parse_args()
 
 
@@ -582,9 +594,28 @@ def main():
             seed=args.seed,
         )
 
+    if int(getattr(args, "max_train_samples", 0) or 0) > 0:
+        nt = min(len(dataset["train"]), int(args.max_train_samples))
+        dataset["train"] = dataset["train"].select(range(nt))
+        print(f"  - max_train_samples: 使用训练子集前 {nt} 条")
+    if int(getattr(args, "max_val_samples", 0) or 0) > 0:
+        nv = min(len(dataset["validation"]), int(args.max_val_samples))
+        dataset["validation"] = dataset["validation"].select(range(nv))
+        print(f"  - max_val_samples: 使用验证子集前 {nv} 条")
+
     total_examples = len(dataset["train"]) + len(dataset["validation"])
-    if total_examples < 100:
-        raise RuntimeError("可用样本过少，建议先检查字段映射或数据质量。")
+    min_need = (
+        20
+        if (
+            int(getattr(args, "max_train_samples", 0) or 0) > 0
+            or int(getattr(args, "max_val_samples", 0) or 0) > 0
+        )
+        else 100
+    )
+    if total_examples < min_need:
+        raise RuntimeError(
+            f"可用样本过少（{total_examples} < {min_need}），请检查数据或提高 --max_train_samples。"
+        )
 
     print("[2/5] 数据集准备完成")
     print(
@@ -642,7 +673,8 @@ def main():
         f"epochs={args.epochs} max_steps={args.max_steps} max_length={args.max_length} "
         f"logging_steps={log_steps} eval_steps={args.eval_steps} save_steps={args.save_steps} "
         f"use_4bit={args.use_4bit} model_dtype={args.model_dtype} "
-        f"train_samples={len(tokenized['train'])} val_samples={len(tokenized['validation'])}",
+        f"train_samples={len(tokenized['train'])} val_samples={len(tokenized['validation'])} "
+        f"max_train_samples={args.max_train_samples or 'all'} max_val_samples={args.max_val_samples or 'all'}",
         flush=True,
     )
     # 便于 nohup 日志：行缓冲；默认关 tqdm 以免 \r 盖住单行指标
