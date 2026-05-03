@@ -2,6 +2,7 @@
 """
 逐步遍历 data/train_v2.jsonl，按 vLLM /v1/chat/completions 格式请求（Instruction + Content 与 val 一致），
 将耗时、post_id、数据集中的标注 output、以及接口返回的 message.content 写入日志。
+可选 --instruction-file：用固定 UTF-8 提示词覆盖每条样本的 instruction（仅换 content）。
 
 默认日志每行格式（TAB 分隔）：
   time_sec<TAB>post_id<TAB>output_json<TAB>content_json
@@ -43,7 +44,7 @@ def post_chat(
     temperature: float,
     timeout_sec: float,
 ) -> Tuple[float, Dict[str, Any]]:
-    """返回 (elapsed_seconds, response_json_dict)。失败时 dict 内含 _bench_http_failed: true（不用 ok，避免与网关 JSON 撞键）。"""
+    """返回 (elapsed_seconds, response_json_dict)。HTTP 非 2xx 或非法 JSON 时 dict 内含 ok: false。"""
     body: Dict[str, Any] = {
         "model": model,
         "messages": [{"role": "user", "content": user_content}],
@@ -63,19 +64,12 @@ def post_chat(
             text = resp.read().decode("utf-8")
     except Exception as exc:
         elapsed = time.perf_counter() - t0
-        return elapsed, {
-            "_bench_http_failed": True,
-            "error": f"{type(exc).__name__}: {exc}",
-        }
+        return elapsed, {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
     elapsed = time.perf_counter() - t0
     try:
         return elapsed, json.loads(text)
     except json.JSONDecodeError:
-        return elapsed, {
-            "_bench_http_failed": True,
-            "error": "invalid_json_response",
-            "raw": text[:4000],
-        }
+        return elapsed, {"ok": False, "error": "invalid_json_response", "raw": text[:4000]}
 
 
 def _message_content_to_str(raw: Any) -> str:
@@ -105,24 +99,13 @@ def extract_assistant_content(resp: Dict[str, Any]) -> str:
     choices = resp.get("choices")
     if not isinstance(choices, list) or not choices:
         return ""
-    ch0 = choices[0]
-    if not isinstance(ch0, dict):
-        return ""
-    # 少数兼容实现把完成文本放在 choice 顶层 text
-    tx = ch0.get("text")
-    if isinstance(tx, str) and tx.strip():
-        return tx
-    msg = ch0.get("message")
+    msg = choices[0].get("message") if isinstance(choices[0], dict) else None
     if not isinstance(msg, dict):
         return ""
     c = msg.get("content")
     s = _message_content_to_str(c)
-    if not s:
-        rc = msg.get("reasoning_content")
-        if isinstance(rc, str):
-            s = rc
-        elif isinstance(rc, list):
-            s = _message_content_to_str(rc)
+    if not s and isinstance(msg.get("reasoning_content"), str):
+        s = msg["reasoning_content"]
     return s
 
 
@@ -167,7 +150,24 @@ def main() -> None:
         action="store_true",
         help="第四列不用 json.dumps，直接写 message.content 原文；TAB/换行改为空格（无 \\\\n \\\" 等 JSON 转义）",
     )
+    p.add_argument(
+        "--instruction-file",
+        type=str,
+        default="",
+        help="若非空：从该 UTF-8 文件读取整段作为 instruction，忽略 JSONL 里的 instruction 字段",
+    )
     args = p.parse_args()
+
+    fixed_instruction = ""
+    if str(args.instruction_file).strip():
+        inst_path = Path(args.instruction_file)
+        if not inst_path.is_file():
+            print(f"error: --instruction-file 不是有效文件: {inst_path}", file=sys.stderr)
+            sys.exit(1)
+        fixed_instruction = inst_path.read_text(encoding="utf-8").strip()
+        if not fixed_instruction:
+            print(f"error: 提示词文件为空: {inst_path}", file=sys.stderr)
+            sys.exit(1)
 
     data_path = Path(args.data)
     if not data_path.is_file():
@@ -201,6 +201,11 @@ def main() -> None:
                 break
             post_id = str(row.get("post_id", ""))
             instruction = str(row.get("instruction", "")).strip()
+            instruction = (
+                fixed_instruction
+                if fixed_instruction
+                else str(row.get("instruction", "")).strip()
+            )
             content = str(row.get("content", "")).strip()
             if not instruction or not content:
                 line = sep.join(
@@ -227,10 +232,10 @@ def main() -> None:
                 args.timeout,
             )
 
+            # 仅 post_chat 失败时带 ok: False；成功响应里若存在 error: null，"error" in resp 仍为 True，
+            # 旧逻辑会误跳过提取，导致 content_json 恒为 ""。
             assistant_text = (
-                ""
-                if resp.get("_bench_http_failed")
-                else extract_assistant_content(resp)
+                "" if resp.get("ok") is False else extract_assistant_content(resp)
             )
 
             # 第三列：数据集中的 output（标注）；第四列：接口返回的 message.content
@@ -256,3 +261,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
