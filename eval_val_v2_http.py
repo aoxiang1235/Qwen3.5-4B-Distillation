@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-遍历 data/val.jsonl，对每条调用 HTTP /generate，将模型返回与金标一并写入 JSONL。
+遍历 data/val_v2.jsonl，对每条调用 HTTP /generate，将模型返回与金标一并写入 JSONL。
 
 每行除 gold_output（来自 val 金标）外，另有：
 - model_output：仅来自服务端解析结果（如 output_json），与金标无关；
@@ -12,7 +12,7 @@
 启动前默认会 GET /health；连不上则直接退出、不会清空输出文件。
 
 用法示例：
-  python3 eval_val_v2_http.py --port 8012 --output data/val_eval_8012.jsonl
+  python3 eval_val_v2_http.py --port 8012 --output data/val_v2_eval_8012.jsonl
   python3 eval_val_v2_http.py --base-url http://127.0.0.1:8012 --limit 3 --output /tmp/smoke.jsonl
 """
 from __future__ import annotations
@@ -110,12 +110,12 @@ def post_generate(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="用 val.jsonl 批量测 HTTP /generate 并落盘")
-    parser.add_argument("--data", type=str, default="data/val.jsonl", help="输入 JSONL")
+    parser = argparse.ArgumentParser(description="用 val_v2.jsonl 批量测 HTTP /generate 并落盘")
+    parser.add_argument("--data", type=str, default="data/val_v2.jsonl", help="输入 JSONL")
     parser.add_argument(
         "--output",
         type=str,
-        default="data/val_eval_8012.jsonl",
+        default="data/val_v2_eval_8012.jsonl",
         help="输出 JSONL（每行一条评测记录；含 model_output：仅来自接口解析结果，与 gold_output 分离）",
     )
     parser.add_argument(
