@@ -378,8 +378,8 @@ def parse_args():
     parser.add_argument(
         "--val_jsonl",
         type=str,
-        default="data/val_v2.jsonl",
-        help="验证集 JSONL 路径（默认 data/val_v2.jsonl；传空字符串则按 val_ratio 从 train 切分）",
+        default="data/val.jsonl",
+        help="验证集 JSONL 路径（默认 data/val.jsonl；传空字符串则按 val_ratio 从 train 切分）",
     )
     parser.add_argument(
         "--model_name",

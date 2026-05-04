@@ -7,6 +7,7 @@
 - `new_mian.py`
   - 作用：主训练脚本（LoRA 微调入口）。
   - 典型用途：启动训练、调参（学习率、batch、max_length 等）、产出训练目录。
+  - 默认数据：**`data/train.jsonl`**、**`data/val.jsonl`**（`--train_jsonl` / `--val_jsonl` 可覆盖；若仍用 `train_v2` / `val_v2` 请显式传入）。
 
 - `prepare_data.py`
   - 作用：训练数据预处理脚本。
@@ -89,11 +90,6 @@
 - `TRAINING_PLAN_AND_RESULTS.md`
   - 作用：训练计划与结果总结文档。
   - 典型用途：作业/汇报时展示实验过程、参数、指标。
-
-- `val_awq_bench.log` / `val_gptq8_bench.log`（示例文件名）
-  - 作用：**`bench_train_v2_vllm.py`** 跑验证集得到的 **TSV 结果**（首列耗时秒、第二列 `post_id`、第三列标注 `output`、第四列模型输出 JSON 字符串）。
-  - 典型用途：量化模型（AWQ / GPTQ）与基线对比；可与对应的 `*_nohup.log` 对照进程输出。
-  - 说明：行数通常与 `data/val.jsonl` 中 **同时具备 instruction 与 content** 的样本条数一致（例如 111 条）。
 
 ## 四、其他文件
 
