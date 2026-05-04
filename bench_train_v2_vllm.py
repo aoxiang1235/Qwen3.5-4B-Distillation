@@ -46,6 +46,7 @@ def post_chat(
     max_tokens: int,
     temperature: float,
     timeout_sec: float,
+    chat_template_kwargs: Optional[Dict[str, Any]] = None,
 ) -> Tuple[float, Dict[str, Any]]:
     """失败时 dict 带 _bench_http_failed（避免与 API 自带的 ok/error 键冲突）。"""
     body: Dict[str, Any] = {
@@ -55,6 +56,8 @@ def post_chat(
         "max_tokens": max_tokens,
         "stream": False,
     }
+    if chat_template_kwargs:
+        body["chat_template_kwargs"] = chat_template_kwargs
     raw_b = json.dumps(body, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(
         url,
@@ -299,6 +302,12 @@ def main() -> None:
         default="",
         help="若非空：从该 UTF-8 文件读取整段作为 instruction，忽略 JSONL 里的 instruction 字段",
     )
+    p.add_argument(
+        "--chat-template-kwargs-json",
+        type=str,
+        default='{"enable_thinking": false}',
+        help='并入请求体 chat_template_kwargs（JSON 字符串）。默认关闭 Qwen3 思考模式；置空串则不发送该字段',
+    )
     args = p.parse_args()
 
     fixed_instruction = ""
@@ -337,6 +346,19 @@ def main() -> None:
     sep = "\t"
     compact = lambda o: json.dumps(o, ensure_ascii=False, separators=(",", ":"))
 
+    tpl_kw: Optional[Dict[str, Any]] = None
+    raw_tpl = str(args.chat_template_kwargs_json).strip()
+    if raw_tpl:
+        try:
+            obj = json.loads(raw_tpl)
+            if not isinstance(obj, dict):
+                print("error: --chat-template-kwargs-json 须为 JSON object", file=sys.stderr)
+                sys.exit(1)
+            tpl_kw = obj
+        except json.JSONDecodeError as exc:
+            print(f"error: --chat-template-kwargs-json 非法 JSON: {exc}", file=sys.stderr)
+            sys.exit(1)
+
     n = 0
     with log_path.open("w", encoding="utf-8") as logf:
         for row in iter_jsonl(data_path):
@@ -373,6 +395,7 @@ def main() -> None:
                 args.max_tokens,
                 args.temperature,
                 args.timeout,
+                chat_template_kwargs=tpl_kw,
             )
 
             assistant_text = (
